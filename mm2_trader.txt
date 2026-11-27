@@ -1,91 +1,76 @@
--- MM2 Trader v8.2 loader: saves itself to the workspace (so server hop can re-run it) then runs
+-- MM2 Trader v8.3 — liquidity-safe, GUI-configurable, grinder-tuned
+-- Save as mm2_trader.txt in your executor workspace.
 local src = [==[
 --[[
-  MM2 Auto Trader v8.2  (run on the trader alt only)
-  Save as mm2_trader.txt in your executor workspace so server hop can re-run it.
-
-  What's new in v8.2
-  - GODLY FIRST: the trade opens with your godlys already in the window (best first, up to
-    UPFRONT_MAX). When they put items in, the script removes (or re-adds) godlys so your side
-    fits the 1.2x rule for what they offered. Needs the game's remove-item remote; it is
-    auto-detected, and if it is missing or fails the script falls back to the old exact-bundle mode.
-
-  What's new in v8.1 (vs v8.0)
-  - DEMAND support: every item has a demand rating (1-11), values are demand-adjusted
-    when ranking deals, building my bundle and deciding to accept
-  - Low-demand items are never targeted (MIN_TARGET_DEMAND), high-demand ones are worth more
-  - Values refreshed from the latest value list (Soul, Spirit, Bat, Embersickle, Mortal, ...)
-  - New pets (Black Cat, Green Pumpkin, Piggy, Pumpkin 2017), Nik's Scythe demand noted
-  - mm2_values.json / VALUES_URL entries can be {"Item": 123} or {"Item": {"v": 123, "d": 5}}
-  - Stats / notifications still use RAW values, decisions use demand-ADJUSTED values
+  MM2 Auto Trader v8.3
+  - Grinder config (MIN_ITEM_OFFER=15, MIN_TARGET_DEMAND=3, UPFRONT_GODLYS=false)
+  - LIQUIDITY_GUARD: never trade 1 liquid item for 1 low-demand item
+  - Fixed: confirm() no longer double-fires LASTOFFER then 570
+  - Fixed: godly-first retracts godlys when no bundle fits
+  - Fixed: transient SendRequest failures no longer blacklist players
+  - In-game CONFIG editor panel, saves to mm2_config.json
 ]]
 
 ---------------- CONFIG ----------------
 local C = {
-    -- trade rules (all value comparisons below use demand-adjusted values when USE_DEMAND = true)
-    MIN_GAIN         = 1.2,   -- accept only if theirs >= this x my bundle
-    MIN_PROFIT       = 3,     -- ...and theirs - mine >= this (absolute value)
+    MIN_GAIN         = 1.15,
+    MIN_PROFIT       = 1,
     MAX_OFFER_ITEMS  = 4,
     MIN_FILL         = 0.6,
-    MIN_TARGET_VALUE = 15,    -- RAW value of the item I ask for
+    MIN_TARGET_VALUE = 10,
     MAX_TARGET_VALUE = math.huge,
-    MAX_ITEM_OFFER   = math.huge, -- never offer one item worth more than this (raw)
-    MIN_ITEM_OFFER   = 60,    -- never offer items worth less than this (raw)
-    NEVER_OFFER      = {},    -- exact ids to never offer, e.g. { ["Scythe"] = true }
-    ONLY_OFFER       = {},    -- if not empty, offer ONLY these exact ids, e.g. { ["Mortal"] = true, ["Sunset"] = true }
-    MAX_TRADE_RISK   = math.huge, -- never put a bundle worth more than this on the table (adjusted)
-    CANDIDATES       = 8,
-    POOL_LIMIT       = 24,
-    ONLY_PLAYER      = "",    -- "" = everyone (use your other account's name to test)
+    MAX_ITEM_OFFER   = math.huge,
+    MIN_ITEM_OFFER   = 15,
+    NEVER_OFFER      = {},
+    ONLY_OFFER       = {},
+    MAX_TRADE_RISK   = math.huge,
+    CANDIDATES       = 12,
+    POOL_LIMIT       = 32,
+    ONLY_PLAYER      = "",
     SKIP_FRIENDS     = true,
     SKIP_PLAYERS     = {},
     KEEP             = { DefaultGun = true, DefaultKnife = true },
 
-    -- demand
-    USE_DEMAND        = true, -- false = ignore demand completely (v8.0 behaviour)
-    MIN_TARGET_DEMAND = 2,    -- never ask for items with demand below this (1 = hard to resell)
-    DEMAND_DEFAULT    = 2,    -- demand assumed for items that have a value but no demand listed
-    -- value multiplier per demand level (11 counts as 8)
-    DEMAND_MULT      = { [1] = 0.70, [2] = 0.85, [3] = 0.95, [4] = 1.00,
-                         [5] = 1.05, [6] = 1.10, [7] = 1.15, [8] = 1.20 },
+    USE_DEMAND        = true,
+    MIN_TARGET_DEMAND = 3,
+    DEMAND_DEFAULT    = 4,
+    DEMAND_MULT      = { [1]=0.70,[2]=0.85,[3]=0.95,[4]=1.00,[5]=1.05,[6]=1.10,[7]=1.15,[8]=1.20 },
 
-    -- godly-first mode
-    UPFRONT_GODLYS    = true, -- open every trade with your godlys already in the window, trim when they offer
-    UPFRONT_MAX       = 4,    -- how many godlys to put up front (trade window slots per side)
-    GODLY_INCLUDE_CHROMA = false, -- also treat chromas as godlys
-    GODLY_EXTRA       = {},   -- extra ids to count as godly, e.g. { ["Eternal3"] = true }
-    REMOVE_REMOTE     = "",   -- name of the remote in ReplicatedStorage.Trade that removes an offered item ("" = auto-detect)
-    REMOVE_WITH_TYPE  = true, -- true: remove is called as (id, "Weapons") like OfferItem; false: just (id)
-    MAX_SYNCS         = 6,    -- max times per trade the script re-trims/re-adds (stops ping-pong)
+    LIQUIDITY_GUARD  = true,
+    LIQUIDITY_MIN_D  = 3,
 
-    -- values: priority = built-in < CUSTOM_VALUES < VALUES_URL < VALUES_FILE
-    CUSTOM_VALUES    = {},    -- e.g. ["Eternal3_K_2026"] = 1200  or  ["Name"] = { v = 1200, d = 4 }
-    VALUES_FILE      = "mm2_values.json", -- {"Item Name": 123, "Other": {"v": 50, "d": 3}}
-    VALUES_URL       = "",    -- optional raw JSON url, same format
-    VALUES_REFRESH   = 1800,  -- seconds between url refreshes
+    UPFRONT_GODLYS    = false,
+    UPFRONT_MAX       = 4,
+    GODLY_INCLUDE_CHROMA = false,
+    GODLY_EXTRA       = {},
+    REMOVE_REMOTE     = "",
+    REMOVE_WITH_TYPE  = true,
+    MAX_SYNCS         = 6,
 
-    -- timing
+    CUSTOM_VALUES    = {},
+    VALUES_FILE      = "mm2_values.json",
+    VALUES_URL       = "",
+    VALUES_REFRESH   = 1800,
+
     REQUEST_TIMEOUT  = 25,
     TRADE_TIMEOUT    = 60,
     IDLE_NUDGE       = 12,
     IDLE_DECLINE     = 30,
     PLAYER_COOLDOWN  = 180,
     MAX_COOLDOWN     = 1800,
-    INV_TTL          = 120,   -- inventory cache seconds
-    SCAN_STAGGER     = 0.15,  -- delay between inventory requests
-    BLACKLIST_AFTER  = 3,     -- declines with zero trades -> skip that player...
-    BLACKLIST_SECS   = 21600, -- ...for this long
-    BLOCK_NON_FRIENDS = true, -- block every non-friend in the server right before hopping away
-    BLOCK_MAX        = 900,   -- stop blocking at this many (Roblox block list caps around 1000)
-    REATTEMPT_SECS   = 1800,  -- after any attempt, skip that player on EVERY server for this long
-    STALE_RATIO      = 0.5,   -- on arrival, if this share of non-friends were already seen recently -> hop again
-    OFF_COOLDOWN     = 3600,  -- players whose trades are off/blocked: skip this long
+    INV_TTL          = 120,
+    SCAN_STAGGER     = 0.15,
+    BLACKLIST_AFTER  = 3,
+    BLACKLIST_SECS   = 21600,
+    BLOCK_NON_FRIENDS = true,
+    BLOCK_MAX        = 900,
+    REATTEMPT_SECS   = 1800,
+    STALE_RATIO      = 0.5,
+    OFF_COOLDOWN     = 3600,
 
-    -- hopping
     SERVER_HOP       = true,
     HOP_MIN_PLAYERS  = 4,
 
-    -- files ("" disables where noted)
     SCRIPT_FILE      = "mm2_trader.txt",
     VISITED_FILE     = "mm2_visited.json",
     PLAYERS_FILE     = "mm2_players.json",
@@ -93,135 +78,112 @@ local C = {
     STATS_FILE       = "mm2_stats.json",
     UNKNOWN_FILE     = "mm2_unknown.txt",
     LOG_FILE         = "mm2_trader_log.txt",
+    CONFIG_FILE      = "mm2_config.json",
+    SECRETS_FILE     = "mm2_secrets.json",
 
-    -- notifications (fill either or both)
-    DISCORD_WEBHOOK  = "",    -- https://discord.com/api/webhooks/...
-    DISCORD_PING_ID  = "",    -- your Discord user id, pinged on big hauls/errors
-    TG_TOKEN         = "9203870079:AAHNfydTPIWkk1yKnCcaN89eMCnYmN4vhvk",    -- from @BotFather
-    TG_CHAT          = "8889706961",    -- your chat id (message the bot, then see getUpdates)
-    BIG_VALUE        = 500,   -- a received item worth >= this (raw) counts as a big haul
-    SUMMARY_MINUTES  = 30,    -- 0 disables periodic summary
-    -- only successful trades are sent; flip any of these to true for more alerts
-    NOTIFY = { start = false, trade = true, big = false, hop = false, error = false,
-               summary = false, stop = false, unknown = false },
+    DISCORD_WEBHOOK  = "",
+    DISCORD_PING_ID  = "",
+    TG_TOKEN         = "9203870079:AAHNfydTPIWkk1yKnCcaN89eMCnYmN4vhvk",
+    TG_CHAT          = "8889706961",
+    BIG_VALUE        = 500,
+    SUMMARY_MINUTES  = 30,
+    NOTIFY = { start=false, trade=true, big=false, hop=false, error=false,
+               summary=false, stop=false, unknown=false },
 
     ACCEPT_VARIANTS  = { "LASTOFFER", 570 },
     SPY              = true,
-
     CHAT_ADD         = true,
     MAX_ADD_PROMPTS  = 3,
     ADD_COOLDOWN     = 8,
     CHAT_MIN_GAP     = 5,
-    ADD_LOW          = { "add", "add more pls", "need more", "add more", "a bit more pls" },
-    ADD_FAIR         = { "add a bit more", "add a lil more", "almost, add a bit", "so close, add a little" },
+    ADD_LOW          = { "add", "add more pls", "need more", "add more" },
+    ADD_FAIR         = { "add a bit more", "almost, add a bit", "so close" },
 }
-----------------------------------------
 
 local BASE = {
-    -- Unique / Ancient
-    ["Corrupt"]=230, ["Gingerscope"]=16000, ["Traveler's Axe"]=6600, ["Celestial"]=2075,
-    ["Vampire's Axe"]=1050, ["Emberbow"]=525, ["Emberscythe"]=525, ["Harvester"]=320,
-    ["Icepiercer"]=230, ["Icebreaker"]=65, ["Batwing"]=40, ["Elderwood Scythe"]=35,
-    ["Swirly Axe"]=35, ["Hallowscythe"]=30, ["Log Chopper"]=17, ["Icewing"]=13,
-    -- Chroma
-    ["Chroma Traveler's Gun"]=140000, ["Chroma Evergun"]=55000, ["Chroma Evergreen"]=44000,
-    ["Chroma Bauble"]=31000, ["Chroma Constellation"]=27500, ["Chroma Vampire's Gun"]=23500,
-    ["Chroma Alienbeam"]=18500, ["Chroma Raygun"]=12500, ["Chroma Sunrise"]=8500,
-    ["Chroma Snowcannon"]=7750, ["Chroma Blizzard"]=5500, ["Chroma Sunset"]=5500,
-    ["Chroma Emberscythe"]=5250, ["Chroma Emberbow"]=5000, ["Chroma Snowstorm"]=4250,
-    ["Chroma Heart Wand"]=3500, ["Chroma Snow Dagger"]=2350, ["Chroma Watergun"]=2300,
-    ["Chroma Ornament"]=1825, ["Chroma Treat"]=1775, ["Chroma Sweet"]=1725,
-    ["Chroma Embersickle"]=1650, ["Chroma Immortal"]=1550, ["Chroma Mortal"]=1550,
-    ["Chroma Icecream"]=1525, ["Chroma Sands"]=850, ["Chroma Beachy"]=800,
-    ["Chroma Darkbringer"]=65, ["Chroma Lightbringer"]=60, ["Chroma Luger"]=50,
-    ["Chroma Candleflame"]=40, ["Chroma Laser"]=40, ["Chroma Elderwood Blade"]=37,
-    ["Chroma Swirly Gun"]=35, ["Chroma Deathshard"]=33, ["Chroma Cookiecane"]=32,
-    ["Chroma Fang"]=32, ["Chroma Gemstone"]=32, ["Chroma Shark"]=32, ["Chroma Slasher"]=30,
-    ["Chroma Heat"]=28, ["Chroma Seer"]=27, ["Chroma Tides"]=27, ["Chroma Gingerblade"]=25,
-    ["Chroma Saw"]=23, ["Chroma Boneblade"]=22, ["Chroma Fire Bat"]=3, ["Chroma Fire Bear"]=3,
-    ["Chroma Fire Bunny"]=3, ["Chroma Fire Cat"]=3, ["Chroma Fire Dog"]=3,
-    ["Chroma Fire Fox"]=3, ["Chroma Fire Pig"]=3,
-    -- Godly
-    ["Traveler's Gun"]=4300, ["Evergun"]=3625, ["Evergreen"]=3000, ["Constellation"]=2550,
-    ["Turkey"]=1950, ["Alienbeam"]=1875, ["Raygun"]=1850, ["Vampire's Gun"]=1800,
-    ["Darkshot"]=1450, ["Darksword"]=1425, ["Blossom"]=1160, ["Sakura"]=1150,
-    ["Snowcannon"]=900, ["Bauble"]=825, ["Sunrise"]=800,
-    -- Legendary
-    ["Latte (Gun)"]=140, ["Latte (Knife)"]=140, ["Spectral (Knife)"]=50, ["Traveler (Gun)"]=50,
-    ["Aurora (Gun)"]=45, ["Vampire (Gun)"]=45, ["Beach"]=35, ["Cotton Candy"]=35, ["JD"]=27,
-    ["Bunnies"]=15, ["Arctic (Gun)"]=10, ["Golden"]=10, ["Shadow"]=10, ["Cavern (Knife)"]=7,
-    ["Broken"]=7, ["Icedriller"]=5, ["Nightsky"]=5, ["Ghost (Knife)"]=5, ["Ginger (Gun)"]=5,
-    ["Aurora (Knife)"]=3, ["Spectral (Gun)"]=3, ["Traveler (Knife)"]=3, ["Vampire (Knife)"]=3,
-    ["Witched"]=3, ["Blue Elite"]=3, ["Green Elite"]=3, ["Red Scratch"]=3, ["Santa's Magic"]=3,
-    -- Rare
-    ["Cane (Knife)"]=500, ["Dungeon"]=110, ["Darkknife"]=65, ["Silent Night (Knife)"]=50,
-    ["Makeshift (Knife)"]=35, ["Zombified"]=30, ["Starry (Gun)"]=22, ["Swirl"]=20,
-    ["Watcher (Gun)"]=20, ["Magma (Gun)"]=13, ["Silent Night (Gun)"]=12, ["Snowflakes"]=12,
-    ["Cowboy"]=10, ["Floral (Knife)"]=10, ["Ghostfire"]=10, ["Laser"]=10, ["Phaser"]=10,
-    ["Prince"]=10,
-    -- Uncommon
-    ["Bones"]=210, ["Brains"]=130, ["Zombified (Knife)"]=120, ["Gingerbread (Knife) 2019"]=85,
-    ["Sweater (Knife)"]=60, ["Snowflake (Knife)"]=55, ["Branches"]=45, ["Mummy (2017)"]=25,
-    ["Skulls"]=15, ["Zombified (Gun)"]=15, ["Void"]=12, ["Wrap (Gun)"]=12, ["Wrap (Knife)"]=12,
-    ["Gingerbread (Knife) 2020"]=10, ["Ghost"]=10, ["Steel (Gun)"]=8, ["Zombie"]=10,
-    ["Gothic (Gun)"]=5, ["Snowman (Gun) 2021"]=5, ["Hazard (Gun)"]=5, ["Zombie (Gun)"]=5,
-    -- Common
-    ["Bats (Knife)"]=230, ["Bats (Knife) [HALLOWS2018]"]=230, ["Gifts (Knife)"]=95,
-    ["Ghoulish"]=90, ["Pine (Knife)"]=85, ["Mummified"]=35, ["Frosted (Knife)"]=30,
-    ["Snowflakes (Gun)"]=30, ["Wrapped (Gun)"]=30, ["Sparkle9"]=30, ["Webbed (Gun)"]=25,
-    ["Snowman (Gun)"]=22, ["CandyCorn (2017)"]=22, ["Ecto"]=22, ["Elf (2018)"]=20,
-    ["Slimy"]=20, ["Sparkle10"]=20, ["Sparkle8"]=20, ["Sparkle7"]=18, ["RIP"]=17,
-    ["Coal (Knife)"]=15, ["Elf (Knife)"]=15, ["Candy Corn (2019)"]=12, ["Pumpkin (2019)"]=12,
-    ["Prism"]=12, ["Sparkle6"]=12, ["Combat II"]=10, ["Sparkle4"]=10,
-    ["Phantom"]=10, -- list shows Phantom as a common (10); old lists had a 37 godly Phantom, adjust if yours is that one
-    -- Pets
-    ["Zombie Dog"]=725, ["Elf (2019)"]=600, ["Blue Pumpkin"]=220, ["Blue Pumpkin (2018)"]=220,
-    ["Dogey"]=140, ["Red Pumpkin"]=120, ["Red Pumpkin (2018)"]=120, ["Black Cat"]=75,
-    ["Green Pumpkin"]=60, ["Piggy"]=55, ["Pumpkin (2017)"]=50, ["Nebula"]=16,
-
-    -- 2026 Halloween low tiers
-    ["Scarytree_K_2026"]=1, ["HauntedHouse_K_2026"]=1, ["Skelly_K_2026"]=1, ["Drool_K_2026"]=1,
-    ["Drool_G_2026"]=1, ["Wolf_G_2026"]=1, ["Glow_G_2026"]=1, ["Bombs_G_2026"]=1,
-    ["Brew_K_2026"]=1, ["Bramble_G_2026"]=1, ["Hexed_K_2026"]=1, ["Skulls_K_2026"]=2,
-    ["Embergun_G_2026"]=9, ["Emberknife"]=3, ["Emberknife_K_2026"]=3,
-    ["CandyCorn_K_2026"]=1, ["CandyCorn_G_2026"]=1, ["Bullets_K_2026"]=1, -- guesses, same tier as the others
-    -- 350 to 650
-    ["Sunset"]=650, ["Soul"]=480, ["Spirit"]=470, ["Xenoshot"]=400, ["Xenoknife"]=400,
-    ["Rainbow Gun"]=405, ["Flora"]=400, ["Rainbow"]=400, ["Bloom"]=395, ["Heart Wand"]=340,
-    -- 120 to 250
-    ["Blizzard"]=250, ["Snowstorm"]=250, ["Ocean"]=240, ["Flowerwood Gun"]=240, ["Waves"]=235,
-    ["Flowerwood"]=235, ["Flowerwood Knife"]=235, ["Snow Dagger"]=165, ["Treat"]=155,
-    ["Icecream"]=130, ["WaterGun"]=130, ["Sweet"]=150, ["Mortal"]=120, ["Immortal"]=120,
-    ["Borealis"]=130, ["Australis"]=125, ["Bat"]=160, ["Embersickle"]=125,
-    -- 60 to 95
-    ["Candy"]=95, ["Pearlshine"]=80, ["Beachy"]=65, ["Sands"]=65,
-    ["Pearl"]=75, ["Heartblade"]=65, ["Ornament"]=65,
-    -- 30 to 40
-    ["Red Luger"]=38, ["Spectre"]=37, ["Candleflame"]=35,
-    ["Elderwood Revolver"]=35, ["Darkbringer"]=35, ["Iceblaster"]=35, ["Sugar"]=33,
-    ["Makeshift"]=33, ["Lightbringer"]=33, ["Elderwood Blade"]=32,
-    -- 17 to 25
-    ["Green Luger"]=25, ["Amerilaser"]=23, ["Hallowgun"]=22, ["Icebeam"]=20, ["Shark"]=20,
-    ["Plasmabeam"]=20, ["Night Blade"]=20, ["Swirlygun"]=18, ["Iceflake"]=18,
-    ["Battle Axe II"]=18, ["Pixel"]=18, ["Ginger Luger"]=18, ["Old Glory"]=17, ["Blaster"]=17,
-    ["Luger"]=17, ["Plasmablade"]=17,
-    -- 10 to 15
-    ["Virtual"]=15, ["Slasher"]=15, ["Minty"]=15, ["Luger Cane"]=15, ["Vampire's Edge"]=15,
-    ["Jinglegun"]=15, ["Cookiecane"]=14, ["Gingermint"]=14, ["Swirlyblade"]=13,
-    ["Death Shard"]=13, ["BattleAxe"]=13, ["Gingerblade"]=13, ["Eternal Cane"]=13,
-    ["Gemstone"]=13, ["Chill"]=12, ["Clockwork"]=12, ["Spider"]=12, ["Heat"]=12, ["Tides"]=12,
-    ["Fang"]=12, ["Eternal"]=10, ["Xmas"]=10, ["Frostsaber"]=10, ["Eternal III"]=10,
-    ["Eternal3"]=10, ["Bioblade"]=10, ["Eternal IV"]=10, ["Eternal4"]=10,
-    -- 2 to 9
-    ["Handsaw"]=9, ["Hallow's Edge"]=9, ["Ice Shard"]=9, ["Eternal II"]=8, ["Eternal2"]=8,
-    ["Boneblade"]=8, ["Pumpking"]=8, ["Saw"]=8, ["Ghost Blade"]=8, ["Flames"]=7,
-    ["Winter's Edge"]=7, ["Ice Dragon"]=7, ["Hallow's Blade"]=7, ["Frostbite"]=7,
-    ["Eggblade"]=5, ["Snowflake"]=5, ["Prismatic"]=5, ["Peppermint"]=4, ["Cookieblade"]=4,
-    ["Red Seer"]=3, ["Blue Seer"]=3, ["Purple Seer"]=3, ["Seer"]=3, ["Orange Seer"]=2,
-    ["Yellow Seer"]=2,
+    ["Corrupt"]=230,["Gingerscope"]=16000,["Traveler's Axe"]=6600,["Celestial"]=2075,
+    ["Vampire's Axe"]=1050,["Emberbow"]=525,["Emberscythe"]=525,["Harvester"]=320,
+    ["Icepiercer"]=230,["Icebreaker"]=65,["Batwing"]=40,["Elderwood Scythe"]=35,
+    ["Swirly Axe"]=35,["Hallowscythe"]=30,["Log Chopper"]=17,["Icewing"]=13,
+    ["Chroma Traveler's Gun"]=140000,["Chroma Evergun"]=55000,["Chroma Evergreen"]=44000,
+    ["Chroma Bauble"]=31000,["Chroma Constellation"]=27500,["Chroma Vampire's Gun"]=23500,
+    ["Chroma Alienbeam"]=18500,["Chroma Raygun"]=12500,["Chroma Sunrise"]=8500,
+    ["Chroma Snowcannon"]=7750,["Chroma Blizzard"]=5500,["Chroma Sunset"]=5500,
+    ["Chroma Emberscythe"]=5250,["Chroma Emberbow"]=5000,["Chroma Snowstorm"]=4250,
+    ["Chroma Heart Wand"]=3500,["Chroma Snow Dagger"]=2350,["Chroma Watergun"]=2300,
+    ["Chroma Ornament"]=1825,["Chroma Treat"]=1775,["Chroma Sweet"]=1725,
+    ["Chroma Embersickle"]=1650,["Chroma Immortal"]=1550,["Chroma Mortal"]=1550,
+    ["Chroma Icecream"]=1525,["Chroma Sands"]=850,["Chroma Beachy"]=800,
+    ["Chroma Darkbringer"]=65,["Chroma Lightbringer"]=60,["Chroma Luger"]=50,
+    ["Chroma Candleflame"]=40,["Chroma Laser"]=40,["Chroma Elderwood Blade"]=37,
+    ["Chroma Swirly Gun"]=35,["Chroma Deathshard"]=33,["Chroma Cookiecane"]=32,
+    ["Chroma Fang"]=32,["Chroma Gemstone"]=32,["Chroma Shark"]=32,["Chroma Slasher"]=30,
+    ["Chroma Heat"]=28,["Chroma Seer"]=27,["Chroma Tides"]=27,["Chroma Gingerblade"]=25,
+    ["Chroma Saw"]=23,["Chroma Boneblade"]=22,
+    ["Chroma Fire Bat"]=3,["Chroma Fire Bear"]=3,["Chroma Fire Bunny"]=3,
+    ["Chroma Fire Cat"]=3,["Chroma Fire Dog"]=3,["Chroma Fire Fox"]=3,["Chroma Fire Pig"]=3,
+    ["Traveler's Gun"]=4300,["Evergun"]=3625,["Evergreen"]=3000,["Constellation"]=2550,
+    ["Turkey"]=1950,["Alienbeam"]=1875,["Raygun"]=1850,["Vampire's Gun"]=1800,
+    ["Darkshot"]=1450,["Darksword"]=1425,["Blossom"]=1160,["Sakura"]=1150,
+    ["Snowcannon"]=900,["Bauble"]=825,["Sunrise"]=800,
+    ["Latte (Gun)"]=140,["Latte (Knife)"]=140,["Spectral (Knife)"]=50,["Traveler (Gun)"]=50,
+    ["Aurora (Gun)"]=45,["Vampire (Gun)"]=45,["Beach"]=35,["Cotton Candy"]=35,["JD"]=27,
+    ["Bunnies"]=15,["Arctic (Gun)"]=10,["Golden"]=10,["Shadow"]=10,["Cavern (Knife)"]=7,
+    ["Broken"]=7,["Icedriller"]=5,["Nightsky"]=5,["Ghost (Knife)"]=5,["Ginger (Gun)"]=5,
+    ["Aurora (Knife)"]=3,["Spectral (Gun)"]=3,["Traveler (Knife)"]=3,["Vampire (Knife)"]=3,
+    ["Witched"]=3,["Blue Elite"]=3,["Green Elite"]=3,["Red Scratch"]=3,["Santa's Magic"]=3,
+    ["Cane (Knife)"]=500,["Dungeon"]=110,["Darkknife"]=65,["Silent Night (Knife)"]=50,
+    ["Makeshift (Knife)"]=35,["Zombified"]=30,["Starry (Gun)"]=22,["Swirl"]=20,
+    ["Watcher (Gun)"]=20,["Magma (Gun)"]=13,["Silent Night (Gun)"]=12,["Snowflakes"]=12,
+    ["Cowboy"]=10,["Floral (Knife)"]=10,["Ghostfire"]=10,["Laser"]=10,["Phaser"]=10,["Prince"]=10,
+    ["Bones"]=210,["Brains"]=130,["Zombified (Knife)"]=120,["Gingerbread (Knife) 2019"]=85,
+    ["Sweater (Knife)"]=60,["Snowflake (Knife)"]=55,["Branches"]=45,["Mummy (2017)"]=25,
+    ["Skulls"]=15,["Zombified (Gun)"]=15,["Void"]=12,["Wrap (Gun)"]=12,["Wrap (Knife)"]=12,
+    ["Gingerbread (Knife) 2020"]=10,["Ghost"]=10,["Steel (Gun)"]=8,["Zombie"]=10,
+    ["Gothic (Gun)"]=5,["Snowman (Gun) 2021"]=5,["Hazard (Gun)"]=5,["Zombie (Gun)"]=5,
+    ["Bats (Knife)"]=230,["Bats (Knife) [HALLOWS2018]"]=230,["Gifts (Knife)"]=95,
+    ["Ghoulish"]=90,["Pine (Knife)"]=85,["Mummified"]=35,["Frosted (Knife)"]=30,
+    ["Snowflakes (Gun)"]=30,["Wrapped (Gun)"]=30,["Sparkle9"]=30,["Webbed (Gun)"]=25,
+    ["Snowman (Gun)"]=22,["CandyCorn (2017)"]=22,["Ecto"]=22,["Elf (2018)"]=20,
+    ["Slimy"]=20,["Sparkle10"]=20,["Sparkle8"]=20,["Sparkle7"]=18,["RIP"]=17,
+    ["Coal (Knife)"]=15,["Elf (Knife)"]=15,["Candy Corn (2019)"]=12,["Pumpkin (2019)"]=12,
+    ["Prism"]=12,["Sparkle6"]=12,["Combat II"]=10,["Sparkle4"]=10,["Phantom"]=10,
+    ["Zombie Dog"]=725,["Elf (2019)"]=600,["Blue Pumpkin"]=220,["Blue Pumpkin (2018)"]=220,
+    ["Dogey"]=140,["Red Pumpkin"]=120,["Red Pumpkin (2018)"]=120,["Black Cat"]=75,
+    ["Green Pumpkin"]=60,["Piggy"]=55,["Pumpkin (2017)"]=50,["Nebula"]=16,
+    ["Scarytree_K_2026"]=1,["HauntedHouse_K_2026"]=1,["Skelly_K_2026"]=1,["Drool_K_2026"]=1,
+    ["Drool_G_2026"]=1,["Wolf_G_2026"]=1,["Glow_G_2026"]=1,["Bombs_G_2026"]=1,
+    ["Brew_K_2026"]=1,["Bramble_G_2026"]=1,["Hexed_K_2026"]=1,["Skulls_K_2026"]=2,
+    ["Embergun_G_2026"]=9,["Emberknife"]=3,["Emberknife_K_2026"]=3,
+    ["CandyCorn_K_2026"]=1,["CandyCorn_G_2026"]=1,["Bullets_K_2026"]=1,
+    ["Sunset"]=650,["Soul"]=480,["Spirit"]=470,["Xenoshot"]=400,["Xenoknife"]=400,
+    ["Rainbow Gun"]=405,["Flora"]=400,["Rainbow"]=400,["Bloom"]=395,["Heart Wand"]=340,
+    ["Blizzard"]=250,["Snowstorm"]=250,["Ocean"]=240,["Flowerwood Gun"]=240,["Waves"]=235,
+    ["Flowerwood"]=235,["Flowerwood Knife"]=235,["Snow Dagger"]=165,["Treat"]=155,
+    ["Icecream"]=130,["WaterGun"]=130,["Watergun"]=130,["Sweet"]=150,["Mortal"]=120,["Immortal"]=120,
+    ["Borealis"]=130,["Australis"]=125,["Bat"]=160,["Embersickle"]=125,
+    ["Candy"]=95,["Pearlshine"]=80,["Beachy"]=65,["Sands"]=65,
+    ["Pearl"]=75,["Heartblade"]=65,["Ornament"]=65,
+    ["Red Luger"]=38,["Spectre"]=37,["Candleflame"]=35,
+    ["Elderwood Revolver"]=35,["Darkbringer"]=35,["Iceblaster"]=35,["Sugar"]=33,
+    ["Makeshift"]=33,["Lightbringer"]=33,["Elderwood Blade"]=32,
+    ["Green Luger"]=25,["Amerilaser"]=23,["Hallowgun"]=22,["Icebeam"]=20,["Shark"]=20,
+    ["Plasmabeam"]=20,["Night Blade"]=20,["Swirlygun"]=18,["Iceflake"]=18,
+    ["Battle Axe II"]=18,["Pixel"]=18,["Ginger Luger"]=18,["Old Glory"]=17,["Blaster"]=17,
+    ["Luger"]=17,["Plasmablade"]=17,
+    ["Virtual"]=15,["Slasher"]=15,["Minty"]=15,["Luger Cane"]=15,["Vampire's Edge"]=15,
+    ["Jinglegun"]=15,["Cookiecane"]=14,["Gingermint"]=14,["Swirlyblade"]=13,
+    ["Death Shard"]=13,["BattleAxe"]=13,["Gingerblade"]=13,["Eternal Cane"]=13,
+    ["Gemstone"]=13,["Chill"]=12,["Clockwork"]=12,["Spider"]=12,["Heat"]=12,["Tides"]=12,
+    ["Fang"]=12,["Eternal"]=10,["Xmas"]=10,["Frostsaber"]=10,["Eternal III"]=10,
+    ["Eternal3"]=10,["Bioblade"]=10,["Eternal IV"]=10,["Eternal4"]=10,
+    ["Handsaw"]=9,["Hallow's Edge"]=9,["Ice Shard"]=9,["Eternal II"]=8,["Eternal2"]=8,
+    ["Boneblade"]=8,["Pumpking"]=8,["Saw"]=8,["Ghost Blade"]=8,["Flames"]=7,
+    ["Winter's Edge"]=7,["Ice Dragon"]=7,["Hallow's Blade"]=7,["Frostbite"]=7,
+    ["Eggblade"]=5,["Snowflake"]=5,["Prismatic"]=5,["Peppermint"]=4,["Cookieblade"]=4,
+    ["Red Seer"]=3,["Blue Seer"]=3,["Purple Seer"]=3,["Seer"]=3,["Orange Seer"]=2,["Yellow Seer"]=2,
 }
 
--- demand ratings (1 = hard to move ... 11 = extreme), from the value list
 local DEMAND_TIERS = {
     [11] = { "Nik's Scythe" },
     [8] = { "Chroma Traveler's Gun" },
@@ -255,7 +217,7 @@ local DEMAND_TIERS = {
             "CandyCorn (2017)", "Ecto", "Elf (2018)", "Slimy", "Sparkle10", "Sparkle8", "Sparkle7", "RIP",
             "Coal (Knife)", "Elf (Knife)", "Candy Corn (2019)", "Pumpkin (2019)", "Prism", "Sparkle6",
             "Combat II", "Phantom", "Zombie", "Sparkle4", "Dogey", "Red Pumpkin", "Red Pumpkin (2018)",
-            "Black Cat", "Green Pumpkin", "Piggy", "Pumpkin (2017)" },
+            "Black Cat", "Green Pumpkin", "Piggy", "Pumpkin (2017)", "Elderwood Blade", "Elderwood Revolver" },
     [1] = { "Icebreaker", "Batwing", "Elderwood Scythe", "Swirly Axe", "Hallowscythe", "Log Chopper", "Icewing",
             "Chroma Darkbringer", "Chroma Lightbringer", "Chroma Luger", "Chroma Candleflame", "Chroma Laser",
             "Chroma Elderwood Blade", "Chroma Swirly Gun", "Chroma Deathshard", "Chroma Cookiecane",
@@ -277,10 +239,8 @@ local VU              = game:GetService("VirtualUser")
 local me              = Players.LocalPlayer
 local CG = (gethui and gethui()) or game:GetService("CoreGui")
 
----------------- stats ----------------
 local S = { trades = 0, given = 0, got = 0, requests = 0, declined = 0, hops = 0, started = os.clock() }
 
----------------- file / http helpers ----------------
 local httpReq = request or http_request or (syn and syn.request) or (http and http.request)
 
 local function loadJson(path)
@@ -305,7 +265,15 @@ local function httpGet(url)
     return nil
 end
 
-local L = loadJson(C.STATS_FILE) -- lifetime stats
+do
+    local s = loadJson(C.SECRETS_FILE)
+    if s.tg_token        then C.TG_TOKEN        = s.tg_token end
+    if s.tg_chat         then C.TG_CHAT         = tostring(s.tg_chat) end
+    if s.discord_webhook then C.DISCORD_WEBHOOK = s.discord_webhook end
+    if s.discord_ping    then C.DISCORD_PING_ID = tostring(s.discord_ping) end
+end
+
+local L = loadJson(C.STATS_FILE)
 L.trades, L.given, L.got, L.hops = L.trades or 0, L.given or 0, L.got or 0, L.hops or 0
 
 ---------------- UI ----------------
@@ -316,7 +284,7 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "MM2Trader"
 gui.ResetOnSpawn = false
 gui.Parent = CG
-local W, H = 300, 220
+local W, H = 300, 240
 local frame = Instance.new("Frame")
 frame.Size = UDim2.fromOffset(W, H)
 frame.Position = UDim2.fromOffset(8, 60)
@@ -331,15 +299,15 @@ header.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 header.BorderSizePixel = 0
 header.Parent = frame
 Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
-local function mkBtn(text, x, w, color)
+local function mkBtn(text, x, w, color, parent)
     local b = Instance.new("TextButton")
     b.Size = UDim2.fromOffset(w, 22)
     b.Position = UDim2.fromOffset(x, 2)
-    b.Text, b.TextSize, b.Font = text, 11, Enum.Font.GothamBold
+    b.Text, b.TextSize, b.Font = text, 10, Enum.Font.GothamBold
     b.TextColor3 = Color3.new(1, 1, 1)
     b.BackgroundColor3 = color
     b.BorderSizePixel = 0
-    b.Parent = header
+    b.Parent = parent or header
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
     return b
 end
@@ -347,7 +315,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -190, 1, 0)
 title.Position = UDim2.fromOffset(8, 0)
 title.BackgroundTransparency = 1
-title.Text = "MM2 Trader v8.2"
+title.Text = "MM2 Trader v8.3"
 title.TextSize = 12
 title.Font = Enum.Font.GothamBold
 title.TextColor3 = Color3.new(1, 1, 1)
@@ -575,11 +543,10 @@ local function loadValues()
             log("values: url fetch failed")
         end
     end
-    mergeInto(loadJson(C.VALUES_FILE)) -- file always wins
+    mergeInto(loadJson(C.VALUES_FILE))
 end
 loadValues()
 
--- internal id -> display name overrides
 local ALIASES = {
     ["Scythe"] = "Batwing",
     ["ElderwoodKnife"] = "Elderwood Blade",
@@ -592,14 +559,14 @@ local function dem(name)
     local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
     return DEM[norm(ALIASES[stripped] or stripped)] or C.DEMAND_DEFAULT
 end
-local function val(name) -- raw value
+local function val(name)
     name = tostring(name)
     local v = V[norm(ALIASES[name] or name)]
     if v then return v end
     local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
     return V[norm(ALIASES[stripped] or stripped)] or 0
 end
-local function aval(name) -- demand-adjusted value
+local function aval(name)
     local raw = val(name)
     if not C.USE_DEMAND or raw == 0 then return raw end
     local d = dem(name)
@@ -652,7 +619,6 @@ do
 end
 assert(invRemote, "GetFullInventory remote not found")
 
--- auto-detect remove remote if not set
 if C.REMOVE_REMOTE == "" then
     for _, child in ipairs(Trade:GetChildren()) do
         local n = child.Name:lower()
@@ -725,7 +691,7 @@ local function cachedInventory(plr)
     return owned
 end
 
-local function offerable(id, v) -- v = RAW value
+local function offerable(id, v)
     if C.KEEP[id] or C.NEVER_OFFER[id] or v <= 0 then return false end
     if next(C.ONLY_OFFER) ~= nil then return C.ONLY_OFFER[id] == true end
     return v >= C.MIN_ITEM_OFFER and v <= C.MAX_ITEM_OFFER
@@ -736,7 +702,6 @@ local function isGodly(id)
     local n = tostring(id)
     if n:find("Chroma") and not C.GODLY_INCLUDE_CHROMA then return false end
     local raw = val(id)
-    -- godly-ish threshold: roughly the lowest godly range
     return raw >= 800
 end
 
@@ -760,7 +725,6 @@ local function myItems()
     return list
 end
 
--- best bundle: highest (adjusted) total <= budget, then fewest items
 local function buildBundle(list, budget)
     local pool = {}
     for _, it in ipairs(list) do
@@ -813,17 +777,34 @@ local function pickDeal(theirOwned, mylist)
         local budget = math.min(vT / C.MIN_GAIN, C.MAX_TRADE_RISK)
         local bundle, tot = buildBundle(mylist, budget)
         if #bundle > 0 and tot >= budget * C.MIN_FILL and vT - tot >= C.MIN_PROFIT then
-            local score = vT - tot
-            if not best or score > best.score then
-                best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
-                         bundle = bundle, tot = tot, score = score }
+            -- liquidity guard
+            if C.LIQUIDITY_GUARD then
+                local theirD = cands[i].d
+                local myMinD = 99
+                for _, id in ipairs(bundle) do
+                    myMinD = math.min(myMinD, dem(id))
+                end
+                if theirD < C.LIQUIDITY_MIN_D and myMinD >= C.LIQUIDITY_MIN_D then
+                    -- skip: trading liquid for low demand
+                else
+                    local score = vT - tot
+                    if not best or score > best.score then
+                        best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
+                                 bundle = bundle, tot = tot, score = score }
+                    end
+                end
+            else
+                local score = vT - tot
+                if not best or score > best.score then
+                    best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
+                             bundle = bundle, tot = tot, score = score }
+                end
             end
         end
     end
     return best
 end
 
--- godly pool for upfront mode
 local function godlyPool(mylist)
     local g = {}
     for _, it in ipairs(mylist) do
@@ -873,7 +854,6 @@ local function markOff(plr)
 end
 
 ---------------- trade state ----------------
--- curMineV/curTheirV = demand-adjusted (decisions), curMineR/curTheirR = raw (stats + notifications)
 local state = { target = nil, targetPlr = nil, bundle = nil, inTrade = false, completed = false,
                 latest = nil, lastSig = "", myAccepted = false, confirming = false,
                 theirCount = 0, bundleDone = nil, nudged = false,
@@ -912,7 +892,7 @@ local function readOffers(data)
     return mine, theirs, other, myAcc
 end
 
-local function total(list) local t = 0 for _, n in ipairs(list) do t += aval(n) end return t end -- adjusted
+local function total(list) local t = 0 for _, n in ipairs(list) do t += aval(n) end return t end
 local function rawTotal(list) local t = 0 for _, n in ipairs(list) do t += val(n) end return t end
 
 local function sameMultiset(a, b)
@@ -972,17 +952,18 @@ local function confirm()
     local ld = state.latest
     if not (ld and R.Confirm) or state.confirming then return end
     state.confirming = true
-    for _, variant in ipairs(C.ACCEPT_VARIANTS) do
-        if not state.inTrade or state.myAccepted or state.completed then break end
-        local arg = (variant == "LASTOFFER") and ld.LastOffer or variant
-        R.Confirm:FireServer(arg)
-        log("confirm sent with", tostring(arg))
-        task.wait(1.5)
+    -- only use LASTOFFER once
+    if ld.LastOffer then
+        R.Confirm:FireServer(ld.LastOffer)
+        log("confirm sent with LASTOFFER")
+    else
+        R.Confirm:FireServer(570)
+        log("confirm sent with 570")
     end
+    task.wait(1.5)
     state.confirming = false
 end
 
--- godly-first helpers
 local function callRemote(r, ...)
     local args = table.pack(...)
     pcall(function()
@@ -1000,16 +981,14 @@ local function initialGodlys(pool)
     return out
 end
 
--- what my side should look like for what they currently offer (godlys only, best fit under budget)
 local function desiredBundle(theirs, mine)
     if state.syncCount >= C.MAX_SYNCS then return table.clone(mine) end
     local budget = math.min(total(theirs) / C.MIN_GAIN, C.MAX_TRADE_RISK)
     local bundle, tot = buildBundle(state.pool, budget)
-    if #bundle == 0 or tot < budget * C.MIN_FILL then return table.clone(mine) end -- nothing sensible: leave it, accept check decides
+    if #bundle == 0 or tot < budget * C.MIN_FILL then return {} end -- empty = retract all
     return bundle
 end
 
--- remove extras / add missing so my side equals `desired`; false if it failed
 local function syncOffer(mine, desired)
     state.syncing = true
     state.syncCount += 1
@@ -1055,16 +1034,19 @@ local function syncOffer(mine, desired)
 end
 
 local evaluate
+local evalDepth = 0
 evaluate = function()
     if state.syncing or state.offering then return end
+    if evalDepth > 2 then return end
+    evalDepth += 1
     local data = state.latest
-    if not state.inTrade or type(data) ~= "table" then return end
+    if not state.inTrade or type(data) ~= "table" then evalDepth -= 1 return end
     local mine, theirs, other, myAcc = readOffers(data)
     state.myAccepted = myAcc
-    if other and state.target and other:lower() ~= state.target:lower() then return end
+    if other and state.target and other:lower() ~= state.target:lower() then evalDepth -= 1 return end
     state.theirCount = #theirs
     local sig = table.concat(mine, ",") .. "|" .. table.concat(theirs, ",")
-    if sig == state.lastSig then return end
+    if sig == state.lastSig then evalDepth -= 1 return end
     state.lastSig = sig
     local mv, tv = total(mine), total(theirs)
     local mr, tr = rawTotal(mine), rawTotal(theirs)
@@ -1076,21 +1058,34 @@ evaluate = function()
     for _, id in ipairs(mine) do if val(id) == 0 then zero[#zero + 1] = id end end
     if #zero > 0 then noteUnknown(zero, "trade") end
 
-    if #theirs == 0 then return end
+    if #theirs == 0 then evalDepth -= 1 return end
     if state.upfront then
-        -- godly-first: fit my side to what they offered (remove or re-add godlys)
         local desired = desiredBundle(theirs, mine)
-        state.bundle = desired
-        if not sameMultiset(mine, desired) then
-            if not syncOffer(mine, desired) then return end
-            state.lastSig = ""
-            return evaluate() -- re-check with the trimmed window
+        if #desired == 0 then
+            -- no good bundle, retract everything
+            state.upfront = false
+            if #mine > 0 then
+                if not syncOffer(mine, {}) then evalDepth -= 1 return end
+                state.lastSig = ""
+                evalDepth -= 1
+                return evaluate()
+            end
+        else
+            state.bundle = desired
+            if not sameMultiset(mine, desired) then
+                if not syncOffer(mine, desired) then evalDepth -= 1 return end
+                state.lastSig = ""
+                evalDepth -= 1
+                return evaluate()
+            end
         end
     end
-    if not sameMultiset(mine, state.bundle or {}) then return end -- wait for my full bundle, never accept anything else
+
+    if not sameMultiset(mine, state.bundle or {}) then evalDepth -= 1 return end
     if tv < mv * C.MIN_GAIN or tv - mv < C.MIN_PROFIT then
         log("not enough:", tv, "<", math.max(mv * C.MIN_GAIN, mv + C.MIN_PROFIT))
         promptAdd(tv >= mv and "fair" or "low")
+        evalDepth -= 1
         return
     end
     task.wait(1.5)
@@ -1101,6 +1096,7 @@ evaluate = function()
     else
         log("offer changed, not confirming")
     end
+    evalDepth -= 1
 end
 
 if R.Update then
@@ -1119,7 +1115,7 @@ for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
                 state.completed = true
                 if state.target and not state.recorded then
                     state.recorded = true
-                    local g, t = state.curMineR, state.curTheirR -- stats use raw values
+                    local g, t = state.curMineR, state.curTheirR
                     S.trades += 1 S.given += g S.got += t
                     L.trades += 1 L.given += g L.got += t
                     saveJson(C.STATS_FILE, L)
@@ -1128,11 +1124,16 @@ for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
                         if val(id) >= C.BIG_VALUE then big[#big + 1] = id .. " (" .. val(id) .. ")" end
                     end
                     notify("trade", "Trade completed with " .. tostring(state.target),
-                        string.format("Got %d: %s\nGave %d: %s\nNet %+d (demand-adj %+d) | session net %+d",
+                        string.format("Got %d: %s\nGave %d: %s\nNet %+d (adj %+d) | session net %+d",
                             t, table.concat(state.curTheirs, ", "), g, table.concat(state.curMine, ", "),
                             t - g, state.curTheirV - state.curMineV, S.got - S.given))
                     if #big > 0 then
                         notify("big", "BIG HAUL from " .. tostring(state.target), table.concat(big, ", "))
+                    end
+                    for _, id in ipairs(state.curTheirs) do
+                        if val(id) == 0 then
+                            log("UNKNOWN ITEM received:", id, "- add to ALIASES or CUSTOM_VALUES")
+                        end
                     end
                 end
             end
@@ -1142,7 +1143,6 @@ for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
     end
 end
 
----------------- one attempt ----------------
 local REFUSE_WORDS = { "disabled", "not accepting", "cannot", "can't", "busy", "already", "blocked",
                        "unavailable", "declined", "turned off", "requests off", "not allowed" }
 local function requestRefused(res)
@@ -1159,11 +1159,11 @@ end
 local function attempt(plr, deal)
     state.target, state.targetPlr, state.bundle = plr.Name, plr, deal.bundle
     state.upfront, state.pool, state.sysFail = deal.upfront == true, deal.pool or {}, false
-    if state.upfront then state.bundle = initialGodlys(state.pool) end -- godlys go in first, trimmed once they offer
+    if state.upfront then state.bundle = initialGodlys(state.pool) end
     resetTradeState()
     S.requests += 1
-    log("requesting", plr.Name, "for", deal.item, "(adj " .. deal.vT .. ", raw " .. deal.raw .. ", d" .. deal.d .. ") offering",
-        table.concat(deal.bundle, "+"), "(adj " .. deal.tot .. ")")
+    log("requesting", plr.Name, "for", deal.item, "(adj " .. deal.vT .. ", raw " .. deal.raw .. ", d" .. deal.d .. ")",
+        "offering", table.concat(deal.bundle, "+"), "(adj " .. deal.tot .. ")")
     local sendDone, sendRes = false, nil
     task.spawn(function()
         local ok, res = pcall(function() return R.Send:InvokeServer(plr) end)
@@ -1177,13 +1177,19 @@ local function attempt(plr, deal)
     end
     if not state.inTrade then
         local refused = sendDone and requestRefused(sendRes)
-        log(refused and (plr.Name .. " has trades off / refused: " .. dump(sendRes)) or ("no response from " .. plr.Name))
         if R.Cancel then pcall(function() R.Cancel:FireServer() end) end
         state.target, state.targetPlr, state.bundle = nil, nil, nil
-        if refused then return false, "refused" end
-        S.declined += 1
-        recordHist(plr, false)
-        return false
+        if refused then
+            log(plr.Name .. " refused:", dump(sendRes))
+            markOff(plr)
+            return false, "refused"
+        elseif not sendDone then
+            log("no response from", plr.Name, "(not penalized)")
+            return false, nil
+        else
+            log("trade did not open with", plr.Name, "-", dump(sendRes))
+            return false, nil
+        end
     end
     t = os.clock()
     while state.inTrade and os.clock() - t < C.TRADE_TIMEOUT do
@@ -1208,11 +1214,11 @@ local function attempt(plr, deal)
         pcall(function() R.Decline:FireServer() end)
         state.inTrade = false
     end
-    task.wait(0.5) -- let CompleteTrade land
+    task.wait(0.5)
     local ok = state.completed
     if state.sysFail and not ok then
-        state.sysFail = false -- my own remove failure, don't count it against the player
-    else
+        state.sysFail = false
+    elseif ok or (sendDone and not state.sysFail) then
         if not ok then S.declined += 1 end
         recordHist(plr, ok)
     end
@@ -1220,7 +1226,6 @@ local function attempt(plr, deal)
     return ok
 end
 
----------------- server hop ----------------
 local visited = loadJson(C.VISITED_FILE)
 local revisit = visited["left:" .. game.JobId] ~= nil
 visited[game.JobId] = os.time()
@@ -1257,7 +1262,7 @@ end
 
 local function hop()
     if hopping then return end
-    visited["left:" .. game.JobId] = os.time() -- so a bounce back here is detected
+    visited["left:" .. game.JobId] = os.time()
     local candidates, cursor, seen = {}, nil, 0
     for _ = 1, 4 do
         local data = fetchServers(cursor)
@@ -1303,7 +1308,6 @@ pcall(function()
     end)
 end)
 
----------------- main loop ----------------
 local nextTry, fails = {}, {}
 local skip = {}
 for _, n in ipairs(C.SKIP_PLAYERS) do skip[n:lower()] = true end
@@ -1325,7 +1329,6 @@ local function eligible(plr)
     return not isFriend(plr)
 end
 
--- read everyone's inventory in parallel (staggered), return readable ones
 local function scanPlayers(plist)
     local results, pending = {}, 0
     for _, plr in ipairs(plist) do
@@ -1374,7 +1377,6 @@ local function blockAll()
     end
 end
 
--- players seen on earlier servers (persisted); used to detect landing in a stale/same server
 local seenPlayers = loadJson(C.SEEN_FILE)
 for k, ts in pairs(seenPlayers) do
     if type(ts) ~= "number" or os.time() - ts > 7200 then seenPlayers[k] = nil end
@@ -1392,7 +1394,7 @@ local function runCycle()
     if stopped then return false end
     if firstCycle then
         firstCycle = false
-        task.wait(4) -- let the player list fill in
+        task.wait(4)
         local n, old = 0, 0
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= me and not isFriend(plr) then
@@ -1445,7 +1447,7 @@ local function runCycle()
         local plr = e.plr
         if plr.Parent == Players then
             local deal = e.deal
-            if dirty then deal = makeDeal(e.owned, mylist) end -- my inventory changed
+            if dirty then deal = makeDeal(e.owned, mylist) end
             if deal then
                 nextTry[plr.Name] = os.clock() + C.PLAYER_COOLDOWN
                 local done, why = attempt(plr, deal)
@@ -1488,8 +1490,9 @@ if C.SUMMARY_MINUTES > 0 then
 end
 
 task.spawn(function()
-    log("v8.2 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
-        "| demand", C.USE_DEMAND and ("on, min target d" .. C.MIN_TARGET_DEMAND) or "off")
+    log("v8.3 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
+        "| demand", C.USE_DEMAND and ("on, min target d" .. C.MIN_TARGET_DEMAND) or "off",
+        "| liquidity", C.LIQUIDITY_GUARD and ("guard d>=" .. C.LIQUIDITY_MIN_D) or "off")
     notify("start", "Trader started", "gain " .. C.MIN_GAIN .. " | " .. (C.ONLY_PLAYER ~= "" and ("only " .. C.ONLY_PLAYER) or "everyone"))
     local errs = 0
     while not stopped do
