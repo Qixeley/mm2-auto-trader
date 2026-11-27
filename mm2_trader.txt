@@ -68,6 +68,8 @@ local C = {
     BLACKLIST_SECS   = 21600,
     BLOCK_NON_FRIENDS = false,
     BLOCK_MAX        = 900,
+    BLOCK_ON_JOIN    = true,  -- on every server join, block ONE player (tries 3 methods)
+    BLOCK_TARGET     = "",    -- username / display name / userId to block; "" = a random non-friend
     REATTEMPT_SECS   = 1800,
     STALE_RATIO      = 0.5,
     OFF_COOLDOWN     = 3600,
@@ -1500,6 +1502,185 @@ local function markSeen()
     saveJson(C.SEEN_FILE, seenPlayers)
 end
 
+---------------- BLOCK ONE PLAYER ON JOIN ----------------
+local StarterGui   = game:GetService("StarterGui")
+local GuiService   = game:GetService("GuiService")
+local CoreGuiSvc   = game:GetService("CoreGui")
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+-- returns true / false, or nil if the blocked list can't be read
+local function isBlocked(userId)
+    local ok, ids = pcall(function() return StarterGui:GetCore("GetBlockedUserIds") end)
+    if not ok or type(ids) ~= "table" then return nil end
+    for _, id in ipairs(ids) do
+        if id == userId then return true end
+    end
+    return false
+end
+
+local function blockedSet()
+    local set = {}
+    local ok, ids = pcall(function() return StarterGui:GetCore("GetBlockedUserIds") end)
+    if ok and type(ids) == "table" then
+        for _, id in ipairs(ids) do set[id] = true end
+    end
+    return set
+end
+
+local function guiText(d)
+    if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then return d.Text end
+    return nil
+end
+
+local function findGui(pred)
+    for _, d in ipairs(CoreGuiSvc:GetDescendants()) do
+        if d:IsA("GuiObject") and d.Visible then
+            local ok, hit = pcall(pred, d)
+            if ok and hit then return d end
+        end
+    end
+    return nil
+end
+
+local function clickGui(obj)
+    local btn = obj
+    while btn and not btn:IsA("GuiButton") do btn = btn.Parent end
+    btn = btn or obj
+    if firesignal and btn:IsA("GuiButton") then
+        local ok = pcall(function()
+            firesignal(btn.MouseButton1Click)
+            firesignal(btn.Activated)
+        end)
+        if ok then return true end
+    end
+    if VIM and btn.AbsoluteSize.X > 0 then
+        local inset = GuiService:GetGuiInset()
+        local p, sz = btn.AbsolutePosition, btn.AbsoluteSize
+        local x, y = p.X + sz.X / 2, p.Y + sz.Y / 2 + inset.Y
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        return true
+    end
+    return false
+end
+
+local function pressKey(k)
+    if not VIM then return false end
+    VIM:SendKeyEvent(true, k, false, game)
+    task.wait(0.1)
+    VIM:SendKeyEvent(false, k, false, game)
+    return true
+end
+
+-- method 1: direct API calls
+local function blockViaApi(plr)
+    local any = false
+    for _, name in ipairs({ "BlockUser", "BlockUserAsync" }) do
+        local ok = pcall(function() me[name](me, plr.UserId) end)
+        any = any or ok
+    end
+    if not any then error("no block API available") end
+end
+
+-- method 2: Roblox's own block prompt, then press its confirm button
+local function blockViaPrompt(plr)
+    StarterGui:SetCore("PromptBlockPlayer", plr)
+    local confirmBtn
+    local t = os.clock()
+    while os.clock() - t < 4 and not confirmBtn do
+        task.wait(0.3)
+        confirmBtn = findGui(function(d)
+            local txt = guiText(d)
+            return txt and txt:lower():gsub("%s", "") == "block"
+        end)
+    end
+    if not confirmBtn then error("block prompt confirm button not found") end
+    clickGui(confirmBtn)
+end
+
+-- method 3: open the Escape menu, find the player, press Block (best effort; UI changes between Roblox versions)
+local function blockViaMenu(plr)
+    if not VIM then error("no VirtualInputManager") end
+    pressKey(Enum.KeyCode.Escape)
+    task.wait(1.2)
+    local entry = findGui(function(d)
+        local txt = guiText(d)
+        return txt and (txt == plr.DisplayName or txt == plr.Name or txt == "@" .. plr.Name)
+    end)
+    if not entry then
+        pressKey(Enum.KeyCode.Escape)
+        error("player entry not found in menu")
+    end
+    clickGui(entry)
+    task.wait(0.8)
+    local blockBtn = findGui(function(d)
+        local txt = guiText(d)
+        if not txt then return false end
+        txt = txt:lower()
+        return txt:find("block", 1, true) and not txt:find("unblock", 1, true)
+    end)
+    if not blockBtn then
+        pressKey(Enum.KeyCode.Escape)
+        error("Block button not found in menu")
+    end
+    clickGui(blockBtn)
+    task.wait(1)
+    -- some versions ask for confirmation
+    local confirm = findGui(function(d)
+        local txt = guiText(d)
+        return txt and txt:lower():gsub("%s", "") == "block"
+    end)
+    if confirm then clickGui(confirm) task.wait(0.8) end
+    pressKey(Enum.KeyCode.Escape)
+end
+
+local function pickBlockTarget()
+    local want = tostring(C.BLOCK_TARGET or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local already = blockedSet()
+    local pool = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= me and not already[plr.UserId] then
+            if want ~= "" then
+                if plr.Name:lower() == want or plr.DisplayName:lower() == want or tostring(plr.UserId) == want then
+                    return plr
+                end
+            elseif not isFriend(plr)
+                and (C.ONLY_PLAYER == "" or plr.Name:lower() ~= C.ONLY_PLAYER:lower()) then
+                pool[#pool + 1] = plr
+            end
+        end
+    end
+    if want ~= "" or #pool == 0 then return nil end
+    return pool[math.random(#pool)]
+end
+
+local blockedThisServer = false
+local function blockOneOnJoin()
+    if not C.BLOCK_ON_JOIN or blockedThisServer then return end
+    blockedThisServer = true
+    if (L.blocked or 0) >= C.BLOCK_MAX then log("block: cap reached, skipping") return end
+    local target = pickBlockTarget()
+    if not target then log("block: nobody to block (target not here or already blocked)") return end
+    log("block: target", target.Name)
+    local methods = { { "api", blockViaApi }, { "prompt", blockViaPrompt }, { "menu", blockViaMenu } }
+    for _, m in ipairs(methods) do
+        local ok, err = pcall(m[2], target)
+        task.wait(1)
+        local b = isBlocked(target.UserId)
+        log("block method", m[1], ok and "ran" or ("failed: " .. tostring(err)), "->",
+            b == true and "BLOCKED" or (b == false and "not blocked" or "unverified"))
+        if b == true then
+            L.blocked = (L.blocked or 0) + 1
+            saveJson(C.STATS_FILE, L)
+            return true
+        end
+    end
+    log("block: all 3 methods failed for", target.Name)
+    return false
+end
+
 local function runCycle()
     while paused and not stopped do task.wait(0.5) end
     if stopped then return false end
@@ -1518,6 +1699,7 @@ local function runCycle()
             log(string.format("server looks stale: %d/%d players already seen", old, n))
         end
         markSeen()
+        if C.BLOCK_ON_JOIN then pcall(blockOneOnJoin) end
     end
     if revisit then
         revisit = false
