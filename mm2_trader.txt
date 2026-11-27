@@ -1,10 +1,16 @@
--- MM2 Trader v8.1 loader: saves itself to the workspace (so server hop can re-run it) then runs
+-- MM2 Trader v8.2 loader: saves itself to the workspace (so server hop can re-run it) then runs
 local src = [==[
 --[[
-  MM2 Auto Trader v8.1  (run on the trader alt only)
+  MM2 Auto Trader v8.2  (run on the trader alt only)
   Save as mm2_trader.txt in your executor workspace so server hop can re-run it.
 
-  What's new vs v8.0
+  What's new in v8.2
+  - GODLY FIRST: the trade opens with your godlys already in the window (best first, up to
+    UPFRONT_MAX). When they put items in, the script removes (or re-adds) godlys so your side
+    fits the 1.2x rule for what they offered. Needs the game's remove-item remote; it is
+    auto-detected, and if it is missing or fails the script falls back to the old exact-bundle mode.
+
+  What's new in v8.1 (vs v8.0)
   - DEMAND support: every item has a demand rating (1-11), values are demand-adjusted
     when ranking deals, building my bundle and deciding to accept
   - Low-demand items are never targeted (MIN_TARGET_DEMAND), high-demand ones are worth more
@@ -42,6 +48,15 @@ local C = {
     -- value multiplier per demand level (11 counts as 8)
     DEMAND_MULT      = { [1] = 0.70, [2] = 0.85, [3] = 0.95, [4] = 1.00,
                          [5] = 1.05, [6] = 1.10, [7] = 1.15, [8] = 1.20 },
+
+    -- godly-first mode
+    UPFRONT_GODLYS    = true, -- open every trade with your godlys already in the window, trim when they offer
+    UPFRONT_MAX       = 4,    -- how many godlys to put up front (trade window slots per side)
+    GODLY_INCLUDE_CHROMA = false, -- also treat chromas as godlys
+    GODLY_EXTRA       = {},   -- extra ids to count as godly, e.g. { ["Eternal3"] = true }
+    REMOVE_REMOTE     = "",   -- name of the remote in ReplicatedStorage.Trade that removes an offered item ("" = auto-detect)
+    REMOVE_WITH_TYPE  = true, -- true: remove is called as (id, "Weapons") like OfferItem; false: just (id)
+    MAX_SYNCS         = 6,    -- max times per trade the script re-trims/re-adds (stops ping-pong)
 
     -- values: priority = built-in < CUSTOM_VALUES < VALUES_URL < VALUES_FILE
     CUSTOM_VALUES    = {},    -- e.g. ["Eternal3_K_2026"] = 1200  or  ["Name"] = { v = 1200, d = 4 }
@@ -332,7 +347,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -190, 1, 0)
 title.Position = UDim2.fromOffset(8, 0)
 title.BackgroundTransparency = 1
-title.Text = "MM2 Trader v8.1"
+title.Text = "MM2 Trader v8.2"
 title.TextSize = 12
 title.Font = Enum.Font.GothamBold
 title.TextColor3 = Color3.new(1, 1, 1)
@@ -637,6 +652,21 @@ do
 end
 assert(invRemote, "GetFullInventory remote not found")
 
+-- auto-detect remove remote if not set
+if C.REMOVE_REMOTE == "" then
+    for _, child in ipairs(Trade:GetChildren()) do
+        local n = child.Name:lower()
+        if n:find("remove") or n:find("unoffer") or n:find("takeback") or n:find("withdraw") then
+            C.REMOVE_REMOTE = child.Name
+            break
+        end
+    end
+end
+if C.REMOVE_REMOTE ~= "" then
+    R.Remove = Trade:FindFirstChild(C.REMOVE_REMOTE)
+end
+local removeBroken = false
+
 if C.SPY and hookmetamethod and getnamecallmethod then
     pcall(function()
         local oldNc
@@ -699,6 +729,15 @@ local function offerable(id, v) -- v = RAW value
     if C.KEEP[id] or C.NEVER_OFFER[id] or v <= 0 then return false end
     if next(C.ONLY_OFFER) ~= nil then return C.ONLY_OFFER[id] == true end
     return v >= C.MIN_ITEM_OFFER and v <= C.MAX_ITEM_OFFER
+end
+
+local function isGodly(id)
+    if C.GODLY_EXTRA[id] then return true end
+    local n = tostring(id)
+    if n:find("Chroma") and not C.GODLY_INCLUDE_CHROMA then return false end
+    local raw = val(id)
+    -- godly-ish threshold: roughly the lowest godly range
+    return raw >= 800
 end
 
 local function myItems()
@@ -784,6 +823,28 @@ local function pickDeal(theirOwned, mylist)
     return best
 end
 
+-- godly pool for upfront mode
+local function godlyPool(mylist)
+    local g = {}
+    for _, it in ipairs(mylist) do
+        if isGodly(it.id) then g[#g + 1] = it end
+    end
+    return g
+end
+
+local function makeDeal(theirOwned, mylist)
+    local deal = pickDeal(theirOwned, mylist)
+    if not deal then return nil end
+    if C.UPFRONT_GODLYS and R.Remove and not removeBroken then
+        local pool = godlyPool(mylist)
+        if #pool > 0 then
+            deal.upfront = true
+            deal.pool = pool
+        end
+    end
+    return deal
+end
+
 ---------------- player history ----------------
 local hist = loadJson(C.PLAYERS_FILE)
 for k, h in pairs(hist) do
@@ -817,7 +878,8 @@ local state = { target = nil, targetPlr = nil, bundle = nil, inTrade = false, co
                 latest = nil, lastSig = "", myAccepted = false, confirming = false,
                 theirCount = 0, bundleDone = nil, nudged = false,
                 curMineV = 0, curTheirV = 0, curMineR = 0, curTheirR = 0,
-                curMine = {}, curTheirs = {}, recorded = false }
+                curMine = {}, curTheirs = {}, recorded = false,
+                upfront = false, pool = {}, syncing = false, syncCount = 0, sysFail = false, offering = false }
 
 local addCount, lastAdd = 0, 0
 local function promptAdd(kind)
@@ -869,6 +931,7 @@ local function resetTradeState()
     state.confirming, state.theirCount, state.bundleDone, state.nudged, state.recorded = false, 0, nil, false, false
     state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = 0, 0, 0, 0
     state.curMine, state.curTheirs = {}, {}
+    state.syncing, state.syncCount, state.offering = false, 0, false
     addCount, lastAdd = 0, 0
 end
 
@@ -892,12 +955,15 @@ if R.Start then
         state.inTrade = true
         log("trade started with", otherName)
         task.wait(1)
-        for _, id in ipairs(state.bundle or {}) do
+        state.offering = true
+        local toOffer = state.upfront and initialGodlys(state.pool) or (state.bundle or {})
+        for _, id in ipairs(toOffer) do
             if not state.inTrade then break end
             R.Offer:FireServer(id, "Weapons")
             log("offered", id, "(" .. val(id) .. ", d" .. dem(id) .. ")")
             task.wait(0.6)
         end
+        state.offering = false
         state.bundleDone = os.clock()
     end)
 end
@@ -916,42 +982,132 @@ local function confirm()
     state.confirming = false
 end
 
+-- godly-first helpers
+local function callRemote(r, ...)
+    local args = table.pack(...)
+    pcall(function()
+        if r:IsA("RemoteFunction") then
+            r:InvokeServer(table.unpack(args, 1, args.n))
+        else
+            r:FireServer(table.unpack(args, 1, args.n))
+        end
+    end)
+end
+
+local function initialGodlys(pool)
+    local out = {}
+    for i = 1, math.min(#pool, C.UPFRONT_MAX) do out[#out + 1] = pool[i].id end
+    return out
+end
+
+-- what my side should look like for what they currently offer (godlys only, best fit under budget)
+local function desiredBundle(theirs, mine)
+    if state.syncCount >= C.MAX_SYNCS then return table.clone(mine) end
+    local budget = math.min(total(theirs) / C.MIN_GAIN, C.MAX_TRADE_RISK)
+    local bundle, tot = buildBundle(state.pool, budget)
+    if #bundle == 0 or tot < budget * C.MIN_FILL then return table.clone(mine) end -- nothing sensible: leave it, accept check decides
+    return bundle
+end
+
+-- remove extras / add missing so my side equals `desired`; false if it failed
+local function syncOffer(mine, desired)
+    state.syncing = true
+    state.syncCount += 1
+    local keep = {}
+    for _, id in ipairs(desired) do keep[id] = (keep[id] or 0) + 1 end
+    local toRemove = {}
+    for _, id in ipairs(mine) do
+        if (keep[id] or 0) > 0 then keep[id] -= 1 else toRemove[#toRemove + 1] = id end
+    end
+    local toAdd = {}
+    for id, n in pairs(keep) do
+        for _ = 1, n do toAdd[#toAdd + 1] = id end
+    end
+    log("adjusting: remove [" .. table.concat(toRemove, ",") .. "] add [" .. table.concat(toAdd, ",") .. "]")
+    for _, id in ipairs(toRemove) do
+        if not state.inTrade then break end
+        if C.REMOVE_WITH_TYPE then callRemote(R.Remove, id, "Weapons") else callRemote(R.Remove, id) end
+        task.wait(0.6)
+    end
+    for _, id in ipairs(toAdd) do
+        if not state.inTrade then break end
+        R.Offer:FireServer(id, "Weapons")
+        task.wait(0.6)
+    end
+    local ok, t = false, os.clock()
+    while state.inTrade and os.clock() - t < 5 do
+        local m = readOffers(state.latest)
+        if sameMultiset(m, desired) then ok = true break end
+        task.wait(0.25)
+    end
+    state.syncing = false
+    if not state.inTrade then return false end
+    if not ok then
+        removeBroken = true
+        state.sysFail = true
+        log("remove did not work (wrong remote/args?) - declining, godly-first off until restart")
+        notify("error", "Godly-first: remove failed", "Remote: " .. tostring(R.Remove and R.Remove.Name) .. " - check the [OUT] log")
+        pcall(function() R.Decline:FireServer() end)
+        state.inTrade = false
+        return false
+    end
+    return true
+end
+
+local evaluate
+evaluate = function()
+    if state.syncing or state.offering then return end
+    local data = state.latest
+    if not state.inTrade or type(data) ~= "table" then return end
+    local mine, theirs, other, myAcc = readOffers(data)
+    state.myAccepted = myAcc
+    if other and state.target and other:lower() ~= state.target:lower() then return end
+    state.theirCount = #theirs
+    local sig = table.concat(mine, ",") .. "|" .. table.concat(theirs, ",")
+    if sig == state.lastSig then return end
+    state.lastSig = sig
+    local mv, tv = total(mine), total(theirs)
+    local mr, tr = rawTotal(mine), rawTotal(theirs)
+    state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = mv, tv, mr, tr
+    state.curMine, state.curTheirs = mine, theirs
+    log("mine(" .. mv .. "/" .. mr .. "):", table.concat(mine, ","), "| theirs(" .. tv .. "/" .. tr .. "):", table.concat(theirs, ","))
+    local zero = {}
+    for _, id in ipairs(theirs) do if val(id) == 0 then zero[#zero + 1] = id end end
+    for _, id in ipairs(mine) do if val(id) == 0 then zero[#zero + 1] = id end end
+    if #zero > 0 then noteUnknown(zero, "trade") end
+
+    if #theirs == 0 then return end
+    if state.upfront then
+        -- godly-first: fit my side to what they offered (remove or re-add godlys)
+        local desired = desiredBundle(theirs, mine)
+        state.bundle = desired
+        if not sameMultiset(mine, desired) then
+            if not syncOffer(mine, desired) then return end
+            state.lastSig = ""
+            return evaluate() -- re-check with the trimmed window
+        end
+    end
+    if not sameMultiset(mine, state.bundle or {}) then return end -- wait for my full bundle, never accept anything else
+    if tv < mv * C.MIN_GAIN or tv - mv < C.MIN_PROFIT then
+        log("not enough:", tv, "<", math.max(mv * C.MIN_GAIN, mv + C.MIN_PROFIT))
+        promptAdd(tv >= mv and "fair" or "low")
+        return
+    end
+    task.wait(1.5)
+    local m2, t2 = readOffers(state.latest)
+    if state.inTrade and table.concat(m2, ",") .. "|" .. table.concat(t2, ",") == sig then
+        log("accepting: they give", tv, "for my", mv, "(raw " .. tr .. " / " .. mr .. ")")
+        confirm()
+    else
+        log("offer changed, not confirming")
+    end
+end
+
 if R.Update then
     R.Update.OnClientEvent:Connect(function(data)
         if not state.inTrade or type(data) ~= "table" then return end
         state.latest = data
-        local mine, theirs, other, myAcc = readOffers(data)
-        state.myAccepted = myAcc
-        if other and state.target and other:lower() ~= state.target:lower() then return end
-        state.theirCount = #theirs
-        local sig = table.concat(mine, ",") .. "|" .. table.concat(theirs, ",")
-        if sig == state.lastSig then return end
-        state.lastSig = sig
-        local mv, tv = total(mine), total(theirs)
-        local mr, tr = rawTotal(mine), rawTotal(theirs)
-        state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = mv, tv, mr, tr
-        state.curMine, state.curTheirs = mine, theirs
-        log("mine(" .. mv .. "/" .. mr .. "):", table.concat(mine, ","), "| theirs(" .. tv .. "/" .. tr .. "):", table.concat(theirs, ","))
-        local zero = {}
-        for _, id in ipairs(theirs) do if val(id) == 0 then zero[#zero + 1] = id end end
-        for _, id in ipairs(mine) do if val(id) == 0 then zero[#zero + 1] = id end end
-        if #zero > 0 then noteUnknown(zero, "trade") end
-
-        if #theirs == 0 then return end
-        if not sameMultiset(mine, state.bundle or {}) then return end -- wait for my full bundle, never accept anything else
-        if tv < mv * C.MIN_GAIN or tv - mv < C.MIN_PROFIT then
-            log("not enough:", tv, "<", math.max(mv * C.MIN_GAIN, mv + C.MIN_PROFIT))
-            promptAdd(tv >= mv and "fair" or "low")
-            return
-        end
-        task.wait(1.5)
-        local m2, t2 = readOffers(state.latest)
-        if state.inTrade and table.concat(m2, ",") .. "|" .. table.concat(t2, ",") == sig then
-            log("accepting: they give", tv, "for my", mv, "(raw " .. tr .. " / " .. mr .. ")")
-            confirm()
-        else
-            log("offer changed, not confirming")
-        end
+        evaluate()
     end)
 end
 
@@ -1002,6 +1158,8 @@ end
 
 local function attempt(plr, deal)
     state.target, state.targetPlr, state.bundle = plr.Name, plr, deal.bundle
+    state.upfront, state.pool, state.sysFail = deal.upfront == true, deal.pool or {}, false
+    if state.upfront then state.bundle = initialGodlys(state.pool) end -- godlys go in first, trimmed once they offer
     resetTradeState()
     S.requests += 1
     log("requesting", plr.Name, "for", deal.item, "(adj " .. deal.vT .. ", raw " .. deal.raw .. ", d" .. deal.d .. ") offering",
@@ -1052,8 +1210,12 @@ local function attempt(plr, deal)
     end
     task.wait(0.5) -- let CompleteTrade land
     local ok = state.completed
-    if not ok then S.declined += 1 end
-    recordHist(plr, ok)
+    if state.sysFail and not ok then
+        state.sysFail = false -- my own remove failure, don't count it against the player
+    else
+        if not ok then S.declined += 1 end
+        recordHist(plr, ok)
+    end
     state.target, state.targetPlr, state.bundle = nil, nil, nil
     return ok
 end
@@ -1270,7 +1432,7 @@ local function runCycle()
     local scans = scanPlayers(shuffle(cands))
     local deals = {}
     for _, r in ipairs(scans) do
-        local d = pickDeal(r.owned, mylist)
+        local d = makeDeal(r.owned, mylist)
         if d then deals[#deals + 1] = { plr = r.plr, owned = r.owned, deal = d } end
     end
     table.sort(deals, function(a, b) return a.deal.score > b.deal.score end)
@@ -1283,7 +1445,7 @@ local function runCycle()
         local plr = e.plr
         if plr.Parent == Players then
             local deal = e.deal
-            if dirty then deal = pickDeal(e.owned, mylist) end -- my inventory changed
+            if dirty then deal = makeDeal(e.owned, mylist) end -- my inventory changed
             if deal then
                 nextTry[plr.Name] = os.clock() + C.PLAYER_COOLDOWN
                 local done, why = attempt(plr, deal)
@@ -1326,7 +1488,7 @@ if C.SUMMARY_MINUTES > 0 then
 end
 
 task.spawn(function()
-    log("v8.1 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
+    log("v8.2 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
         "| demand", C.USE_DEMAND and ("on, min target d" .. C.MIN_TARGET_DEMAND) or "off")
     notify("start", "Trader started", "gain " .. C.MIN_GAIN .. " | " .. (C.ONLY_PLAYER ~= "" and ("only " .. C.ONLY_PLAYER) or "everyone"))
     local errs = 0
