@@ -1,3 +1,5 @@
+-- MM2 Trader v8.0 loader: saves itself to the workspace (so server hop can re-run it) then runs
+local src = [==[
 --[[
   MM2 Auto Trader v8.0  (run on the trader alt only)
   Save as mm2_trader.txt in your executor workspace so server hop can re-run it.
@@ -50,6 +52,10 @@ local C = {
     SCAN_STAGGER     = 0.15,  -- delay between inventory requests
     BLACKLIST_AFTER  = 3,     -- declines with zero trades -> skip that player...
     BLACKLIST_SECS   = 21600, -- ...for this long
+    BLOCK_NON_FRIENDS = true, -- block every non-friend in the server right before hopping away
+    BLOCK_MAX        = 900,   -- stop blocking at this many (Roblox block list caps around 1000)
+    REATTEMPT_SECS   = 1800,  -- after any attempt, skip that player on EVERY server for this long
+    STALE_RATIO      = 0.5,   -- on arrival, if this share of non-friends were already seen recently -> hop again
     OFF_COOLDOWN     = 3600,  -- players whose trades are off/blocked: skip this long
 
     -- hopping
@@ -60,6 +66,7 @@ local C = {
     SCRIPT_FILE      = "mm2_trader.txt",
     VISITED_FILE     = "mm2_visited.json",
     PLAYERS_FILE     = "mm2_players.json",
+    SEEN_FILE        = "mm2_seen.json",
     STATS_FILE       = "mm2_stats.json",
     UNKNOWN_FILE     = "mm2_unknown.txt",
     LOG_FILE         = "mm2_trader_log.txt",
@@ -708,7 +715,16 @@ local function recordHist(plr, ok)
     local k = tostring(plr.UserId)
     local h = hist[k] or { d = 0, ok = 0 }
     h.t = os.time()
+    h.off = nil
     if ok then h.ok = (h.ok or 0) + 1 h.d = 0 else h.d = (h.d or 0) + 1 end
+    hist[k] = h
+    saveJson(C.PLAYERS_FILE, hist)
+end
+
+local function markOff(plr)
+    local k = tostring(plr.UserId)
+    local h = hist[k] or { d = 0, ok = 0 }
+    h.t, h.off = os.time(), true
     hist[k] = h
     saveJson(C.PLAYERS_FILE, hist)
 end
@@ -1053,6 +1069,8 @@ local function eligible(plr)
     if skip[plr.Name:lower()] then return false end
     if (nextTry[plr.Name] or 0) > os.clock() then return false end
     if blacklisted(plr) then return false end
+    local h = hist[tostring(plr.UserId)]
+    if h and os.time() - (h.t or 0) < (h.off and C.OFF_COOLDOWN or C.REATTEMPT_SECS) then return false end
     return not isFriend(plr)
 end
 
@@ -1079,13 +1097,68 @@ local function summaryText()
         S.trades, S.got - S.given, S.got, S.given, S.hops, mins, L.trades, L.got - L.given, L.hops)
 end
 
+local blockWorks = nil
+local function blockAll()
+    if not C.BLOCK_NON_FRIENDS or blockWorks == false then return end
+    local n = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if (L.blocked or 0) >= C.BLOCK_MAX then log("block cap reached, not blocking more") break end
+        if plr ~= me and not isFriend(plr) then
+            local ok = pcall(function() me:BlockUser(plr.UserId) end)
+            if ok then
+                n += 1
+                L.blocked = (L.blocked or 0) + 1
+                blockWorks = true
+            elseif blockWorks == nil then
+                blockWorks = false
+                log("blocking not supported here (BlockUser failed) - disabled")
+                break
+            end
+            task.wait(0.3)
+        end
+    end
+    if n > 0 then
+        saveJson(C.STATS_FILE, L)
+        log("blocked " .. n .. " players (total " .. (L.blocked or 0) .. ")")
+    end
+end
+
+-- players seen on earlier servers (persisted); used to detect landing in a stale/same server
+local seenPlayers = loadJson(C.SEEN_FILE)
+for k, ts in pairs(seenPlayers) do
+    if type(ts) ~= "number" or os.time() - ts > 7200 then seenPlayers[k] = nil end
+end
+local firstCycle = true
+local function markSeen()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= me then seenPlayers[tostring(plr.UserId)] = os.time() end
+    end
+    saveJson(C.SEEN_FILE, seenPlayers)
+end
+
 local function runCycle()
     while paused and not stopped do task.wait(0.5) end
     if stopped then return false end
+    if firstCycle then
+        firstCycle = false
+        task.wait(4) -- let the player list fill in
+        local n, old = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= me and not isFriend(plr) then
+                n += 1
+                if seenPlayers[tostring(plr.UserId)] then old += 1 end
+            end
+        end
+        if n >= 3 and old / n >= C.STALE_RATIO then
+            revisit = true
+            log(string.format("server looks stale: %d/%d players already seen", old, n))
+        end
+        markSeen()
+    end
     if revisit then
         revisit = false
         log("landed back on a server I already left - hopping again")
-        if C.SERVER_HOP then hop() end
+        if C.SERVER_HOP then blockAll() hop() end
         task.wait(10)
         return true
     end
@@ -1137,6 +1210,7 @@ local function runCycle()
                     end
                 elseif why == "refused" then
                     nextTry[plr.Name] = os.clock() + C.OFF_COOLDOWN
+                    markOff(plr)
                 else
                     local f = (fails[plr.Name] or 0) + 1
                     fails[plr.Name] = f
@@ -1147,7 +1221,7 @@ local function runCycle()
         end
     end
     if not didTrade then
-        if C.SERVER_HOP then hop() end
+        if C.SERVER_HOP then blockAll() hop() end
         task.wait(10)
     end
     return true
@@ -1180,3 +1254,9 @@ task.spawn(function()
     end
     log("stopped")
 end)
+
+]==]
+if writefile then pcall(writefile, "mm2_trader.txt", src) end
+local fn, err = loadstring(src)
+if not fn then warn("MM2 Trader failed to load: " .. tostring(err)) return end
+fn()
