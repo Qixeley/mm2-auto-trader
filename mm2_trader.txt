@@ -1,33 +1,33 @@
--- MM2 Trader v8.0 loader: saves itself to the workspace (so server hop can re-run it) then runs
+-- MM2 Trader v8.1 loader: saves itself to the workspace (so server hop can re-run it) then runs
 local src = [==[
 --[[
-  MM2 Auto Trader v8.0  (run on the trader alt only)
+  MM2 Auto Trader v8.1  (run on the trader alt only)
   Save as mm2_trader.txt in your executor workspace so server hop can re-run it.
 
-  What's new vs v7.3
-  - Scans ALL players in parallel, ranks every possible deal, trades the best first
-  - Inventory cache, persistent player history (auto-blacklists people who always decline)
-  - Safer accept: my side must match my bundle exactly + min absolute profit + risk cap
-  - External values: mm2_values.json (edit without touching the script) and/or VALUES_URL
-  - Discord webhook AND Telegram bot notifications (trades, big hauls, errors, summaries)
-  - Lifetime stats saved to disk, periodic summaries, pause/resume button, crash watchdog
-  - Unknown item ids (mine AND theirs) saved to mm2_unknown.txt so you can value them
+  What's new vs v8.0
+  - DEMAND support: every item has a demand rating (1-11), values are demand-adjusted
+    when ranking deals, building my bundle and deciding to accept
+  - Low-demand items are never targeted (MIN_TARGET_DEMAND), high-demand ones are worth more
+  - Values refreshed from the latest value list (Soul, Spirit, Bat, Embersickle, Mortal, ...)
+  - New pets (Black Cat, Green Pumpkin, Piggy, Pumpkin 2017), Nik's Scythe demand noted
+  - mm2_values.json / VALUES_URL entries can be {"Item": 123} or {"Item": {"v": 123, "d": 5}}
+  - Stats / notifications still use RAW values, decisions use demand-ADJUSTED values
 ]]
 
 ---------------- CONFIG ----------------
 local C = {
-    -- trade rules
+    -- trade rules (all value comparisons below use demand-adjusted values when USE_DEMAND = true)
     MIN_GAIN         = 1.2,   -- accept only if theirs >= this x my bundle
     MIN_PROFIT       = 3,     -- ...and theirs - mine >= this (absolute value)
     MAX_OFFER_ITEMS  = 4,
     MIN_FILL         = 0.6,
-    MIN_TARGET_VALUE = 15,
+    MIN_TARGET_VALUE = 15,    -- RAW value of the item I ask for
     MAX_TARGET_VALUE = math.huge,
-    MAX_ITEM_OFFER   = math.huge, -- never offer one item worth more than this
-    MIN_ITEM_OFFER   = 60,    -- never offer items worth less than this (keeps commons/rares/uncommons/legendaries out)
+    MAX_ITEM_OFFER   = math.huge, -- never offer one item worth more than this (raw)
+    MIN_ITEM_OFFER   = 60,    -- never offer items worth less than this (raw)
     NEVER_OFFER      = {},    -- exact ids to never offer, e.g. { ["Scythe"] = true }
     ONLY_OFFER       = {},    -- if not empty, offer ONLY these exact ids, e.g. { ["Mortal"] = true, ["Sunset"] = true }
-    MAX_TRADE_RISK   = math.huge, -- never put a bundle worth more than this on the table
+    MAX_TRADE_RISK   = math.huge, -- never put a bundle worth more than this on the table (adjusted)
     CANDIDATES       = 8,
     POOL_LIMIT       = 24,
     ONLY_PLAYER      = "",    -- "" = everyone (use your other account's name to test)
@@ -35,9 +35,17 @@ local C = {
     SKIP_PLAYERS     = {},
     KEEP             = { DefaultGun = true, DefaultKnife = true },
 
+    -- demand
+    USE_DEMAND        = true, -- false = ignore demand completely (v8.0 behaviour)
+    MIN_TARGET_DEMAND = 2,    -- never ask for items with demand below this (1 = hard to resell)
+    DEMAND_DEFAULT    = 2,    -- demand assumed for items that have a value but no demand listed
+    -- value multiplier per demand level (11 counts as 8)
+    DEMAND_MULT      = { [1] = 0.70, [2] = 0.85, [3] = 0.95, [4] = 1.00,
+                         [5] = 1.05, [6] = 1.10, [7] = 1.15, [8] = 1.20 },
+
     -- values: priority = built-in < CUSTOM_VALUES < VALUES_URL < VALUES_FILE
-    CUSTOM_VALUES    = {},    -- e.g. ["Eternal3_K_2026"] = 1200
-    VALUES_FILE      = "mm2_values.json", -- {"Item Name": 123, ...}
+    CUSTOM_VALUES    = {},    -- e.g. ["Eternal3_K_2026"] = 1200  or  ["Name"] = { v = 1200, d = 4 }
+    VALUES_FILE      = "mm2_values.json", -- {"Item Name": 123, "Other": {"v": 50, "d": 3}}
     VALUES_URL       = "",    -- optional raw JSON url, same format
     VALUES_REFRESH   = 1800,  -- seconds between url refreshes
 
@@ -76,7 +84,7 @@ local C = {
     DISCORD_PING_ID  = "",    -- your Discord user id, pinged on big hauls/errors
     TG_TOKEN         = "9203870079:AAHNfydTPIWkk1yKnCcaN89eMCnYmN4vhvk",    -- from @BotFather
     TG_CHAT          = "8889706961",    -- your chat id (message the bot, then see getUpdates)
-    BIG_VALUE        = 500,   -- a received item worth >= this counts as a big haul
+    BIG_VALUE        = 500,   -- a received item worth >= this (raw) counts as a big haul
     SUMMARY_MINUTES  = 30,    -- 0 disables periodic summary
     -- only successful trades are sent; flip any of these to true for more alerts
     NOTIFY = { start = false, trade = true, big = false, hop = false, error = false,
@@ -140,7 +148,7 @@ local BASE = {
     ["Bones"]=210, ["Brains"]=130, ["Zombified (Knife)"]=120, ["Gingerbread (Knife) 2019"]=85,
     ["Sweater (Knife)"]=60, ["Snowflake (Knife)"]=55, ["Branches"]=45, ["Mummy (2017)"]=25,
     ["Skulls"]=15, ["Zombified (Gun)"]=15, ["Void"]=12, ["Wrap (Gun)"]=12, ["Wrap (Knife)"]=12,
-    ["Gingerbread (Knife) 2020"]=10, ["Ghost"]=10, ["Steel (Gun)"]=8, ["Zombie"]=7,
+    ["Gingerbread (Knife) 2020"]=10, ["Ghost"]=10, ["Steel (Gun)"]=8, ["Zombie"]=10,
     ["Gothic (Gun)"]=5, ["Snowman (Gun) 2021"]=5, ["Hazard (Gun)"]=5, ["Zombie (Gun)"]=5,
     -- Common
     ["Bats (Knife)"]=230, ["Bats (Knife) [HALLOWS2018]"]=230, ["Gifts (Knife)"]=95,
@@ -150,9 +158,11 @@ local BASE = {
     ["Slimy"]=20, ["Sparkle10"]=20, ["Sparkle8"]=20, ["Sparkle7"]=18, ["RIP"]=17,
     ["Coal (Knife)"]=15, ["Elf (Knife)"]=15, ["Candy Corn (2019)"]=12, ["Pumpkin (2019)"]=12,
     ["Prism"]=12, ["Sparkle6"]=12, ["Combat II"]=10, ["Sparkle4"]=10,
+    ["Phantom"]=10, -- list shows Phantom as a common (10); old lists had a 37 godly Phantom, adjust if yours is that one
     -- Pets
-    ["Zombie Dog"]=725, ["Elf (2019)"]=650, ["Blue Pumpkin (2018)"]=215, ["Dogey"]=145,
-    ["Red Pumpkin (2018)"]=125, ["Nebula"]=16,
+    ["Zombie Dog"]=725, ["Elf (2019)"]=600, ["Blue Pumpkin"]=220, ["Blue Pumpkin (2018)"]=220,
+    ["Dogey"]=140, ["Red Pumpkin"]=120, ["Red Pumpkin (2018)"]=120, ["Black Cat"]=75,
+    ["Green Pumpkin"]=60, ["Piggy"]=55, ["Pumpkin (2017)"]=50, ["Nebula"]=16,
 
     -- 2026 Halloween low tiers
     ["Scarytree_K_2026"]=1, ["HauntedHouse_K_2026"]=1, ["Skelly_K_2026"]=1, ["Drool_K_2026"]=1,
@@ -161,18 +171,18 @@ local BASE = {
     ["Embergun_G_2026"]=9, ["Emberknife"]=3, ["Emberknife_K_2026"]=3,
     ["CandyCorn_K_2026"]=1, ["CandyCorn_G_2026"]=1, ["Bullets_K_2026"]=1, -- guesses, same tier as the others
     -- 350 to 650
-    ["Sunset"]=650, ["Soul"]=625, ["Spirit"]=615, ["Xenoshot"]=440, ["Xenoknife"]=435,
-    ["Rainbow Gun"]=410, ["Flora"]=405, ["Rainbow"]=400, ["Bloom"]=395, ["Heart Wand"]=350,
+    ["Sunset"]=650, ["Soul"]=480, ["Spirit"]=470, ["Xenoshot"]=400, ["Xenoknife"]=400,
+    ["Rainbow Gun"]=405, ["Flora"]=400, ["Rainbow"]=400, ["Bloom"]=395, ["Heart Wand"]=340,
     -- 120 to 250
-    ["Blizzard"]=250, ["Snowstorm"]=250, ["Ocean"]=240, ["Flowerwood Gun"]=235, ["Waves"]=235,
-    ["Flowerwood"]=230, ["Flowerwood Knife"]=230, ["Snow Dagger"]=170, ["Treat"]=155,
-    ["Icecream"]=155, ["WaterGun"]=150, ["Sweet"]=150, ["Mortal"]=140, ["Immortal"]=140,
-    ["Borealis"]=140, ["Australis"]=135, ["Bat"]=120,
-    -- 60 to 90
-    ["Candy"]=90, ["Embersickle"]=80, ["Pearlshine"]=80, ["Beachy"]=80, ["Sands"]=80,
-    ["Pearl"]=75, ["Heartblade"]=65, ["Ornament"]=60,
+    ["Blizzard"]=250, ["Snowstorm"]=250, ["Ocean"]=240, ["Flowerwood Gun"]=240, ["Waves"]=235,
+    ["Flowerwood"]=235, ["Flowerwood Knife"]=235, ["Snow Dagger"]=165, ["Treat"]=155,
+    ["Icecream"]=130, ["WaterGun"]=130, ["Sweet"]=150, ["Mortal"]=120, ["Immortal"]=120,
+    ["Borealis"]=130, ["Australis"]=125, ["Bat"]=160, ["Embersickle"]=125,
+    -- 60 to 95
+    ["Candy"]=95, ["Pearlshine"]=80, ["Beachy"]=65, ["Sands"]=65,
+    ["Pearl"]=75, ["Heartblade"]=65, ["Ornament"]=65,
     -- 30 to 40
-    ["Red Luger"]=38, ["Phantom"]=37, ["Spectre"]=37, ["Candleflame"]=35,
+    ["Red Luger"]=38, ["Spectre"]=37, ["Candleflame"]=35,
     ["Elderwood Revolver"]=35, ["Darkbringer"]=35, ["Iceblaster"]=35, ["Sugar"]=33,
     ["Makeshift"]=33, ["Lightbringer"]=33, ["Elderwood Blade"]=32,
     -- 17 to 25
@@ -194,6 +204,52 @@ local BASE = {
     ["Eggblade"]=5, ["Snowflake"]=5, ["Prismatic"]=5, ["Peppermint"]=4, ["Cookieblade"]=4,
     ["Red Seer"]=3, ["Blue Seer"]=3, ["Purple Seer"]=3, ["Seer"]=3, ["Orange Seer"]=2,
     ["Yellow Seer"]=2,
+}
+
+-- demand ratings (1 = hard to move ... 11 = extreme), from the value list
+local DEMAND_TIERS = {
+    [11] = { "Nik's Scythe" },
+    [8] = { "Chroma Traveler's Gun" },
+    [7] = { "Chroma Evergun", "Chroma Evergreen", "Chroma Bauble" },
+    [6] = { "Celestial", "Chroma Constellation", "Chroma Vampire's Gun", "Chroma Alienbeam",
+            "Evergun", "Evergreen", "Constellation", "Bauble" },
+    [5] = { "Gingerscope", "Traveler's Axe", "Vampire's Axe", "Emberbow", "Emberscythe",
+            "Chroma Raygun", "Chroma Sunrise", "Chroma Snowcannon", "Chroma Blizzard", "Chroma Sunset",
+            "Chroma Emberscythe", "Chroma Emberbow", "Chroma Snowstorm", "Chroma Heart Wand",
+            "Chroma Snow Dagger", "Chroma Watergun", "Chroma Ornament", "Chroma Treat", "Chroma Sweet",
+            "Chroma Embersickle", "Chroma Immortal", "Chroma Mortal", "Chroma Icecream", "Chroma Sands",
+            "Chroma Beachy", "Traveler's Gun", "Turkey", "Alienbeam", "Raygun", "Vampire's Gun",
+            "Darkshot", "Darksword", "Blossom", "Sakura", "Snowcannon", "Sunrise", "Sunset", "Soul", "Spirit" },
+    [4] = { "Harvester", "Icepiercer", "Rainbow Gun", "Flora", "Rainbow", "Xenoknife", "Xenoshot",
+            "Bloom", "Heart Wand", "Cane (Knife)", "Zombie Dog", "Elf (2019)" },
+    [3] = { "Corrupt", "Blizzard", "Snowstorm", "Flowerwood Gun", "Ocean", "Flowerwood", "Flowerwood Knife",
+            "Waves", "Snow Dagger", "Bat", "Treat", "Sweet", "Mortal", "Immortal", "Icecream", "Watergun",
+            "Borealis", "Australis", "Latte (Gun)", "Latte (Knife)", "Bones", "Bats (Knife)",
+            "Bats (Knife) [HALLOWS2018]", "Blue Pumpkin", "Blue Pumpkin (2018)" },
+    [2] = { "Embersickle", "Candy", "Pearlshine", "Pearl", "Beachy", "Sands", "Heartblade", "Ornament",
+            "Spectral (Knife)", "Traveler (Gun)", "Aurora (Gun)", "Vampire (Gun)", "Beach", "Cotton Candy",
+            "JD", "Bunnies", "Arctic (Gun)", "Golden", "Shadow", "Cavern (Knife)", "Broken", "Icedriller",
+            "Nightsky", "Emberknife", "Emberknife_K_2026", "Embergun_G_2026", "Skulls_K_2026",
+            "Dungeon", "Darkknife", "Silent Night (Knife)", "Makeshift (Knife)", "Zombified", "Starry (Gun)",
+            "Swirl", "Watcher (Gun)", "Magma (Gun)", "Silent Night (Gun)", "Snowflakes", "Cowboy",
+            "Floral (Knife)", "Ghostfire", "Laser", "Phaser", "Prince", "Brains", "Zombified (Knife)",
+            "Gingerbread (Knife) 2019", "Sweater (Knife)", "Snowflake (Knife)", "Branches", "Mummy (2017)",
+            "Skulls", "Zombified (Gun)", "Void", "Wrap (Gun)", "Wrap (Knife)", "Gingerbread (Knife) 2020",
+            "Ghost", "Gifts (Knife)", "Ghoulish", "Pine (Knife)", "Mummified", "Frosted (Knife)",
+            "Snowflakes (Gun)", "Wrapped (Gun)", "Sparkle9", "Webbed (Gun)", "Snowman (Gun)",
+            "CandyCorn (2017)", "Ecto", "Elf (2018)", "Slimy", "Sparkle10", "Sparkle8", "Sparkle7", "RIP",
+            "Coal (Knife)", "Elf (Knife)", "Candy Corn (2019)", "Pumpkin (2019)", "Prism", "Sparkle6",
+            "Combat II", "Phantom", "Zombie", "Sparkle4", "Dogey", "Red Pumpkin", "Red Pumpkin (2018)",
+            "Black Cat", "Green Pumpkin", "Piggy", "Pumpkin (2017)" },
+    [1] = { "Icebreaker", "Batwing", "Elderwood Scythe", "Swirly Axe", "Hallowscythe", "Log Chopper", "Icewing",
+            "Chroma Darkbringer", "Chroma Lightbringer", "Chroma Luger", "Chroma Candleflame", "Chroma Laser",
+            "Chroma Elderwood Blade", "Chroma Swirly Gun", "Chroma Deathshard", "Chroma Cookiecane",
+            "Chroma Fang", "Chroma Gemstone", "Chroma Shark", "Chroma Slasher", "Chroma Heat", "Chroma Seer",
+            "Chroma Tides", "Chroma Gingerblade", "Chroma Saw", "Chroma Boneblade",
+            "Chroma Fire Bat", "Chroma Fire Bear", "Chroma Fire Bunny", "Chroma Fire Cat", "Chroma Fire Dog",
+            "Chroma Fire Fox", "Chroma Fire Pig", "Ghost (Knife)", "Ginger (Gun)",
+            "Scarytree_K_2026", "HauntedHouse_K_2026", "Skelly_K_2026", "Drool_K_2026", "Drool_G_2026",
+            "Wolf_G_2026", "Glow_G_2026", "Bombs_G_2026", "Brew_K_2026", "Bramble_G_2026", "Hexed_K_2026" },
 }
 
 local Players         = game:GetService("Players")
@@ -276,7 +332,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -190, 1, 0)
 title.Position = UDim2.fromOffset(8, 0)
 title.BackgroundTransparency = 1
-title.Text = "MM2 Trader v8.0"
+title.Text = "MM2 Trader v8.1"
 title.TextSize = 12
 title.Font = Enum.Font.GothamBold
 title.TextColor3 = Color3.new(1, 1, 1)
@@ -475,16 +531,24 @@ local function queueScript()
     return false
 end
 
----------------- values ----------------
+---------------- values + demand ----------------
 local function norm(s) return (tostring(s):lower():gsub("[^%w]", "")) end
-local V = {}
+local V, DEM = {}, {}
 local function mergeInto(t)
     for k, v in pairs(t) do
-        if type(v) == "number" then V[norm(k)] = v end
+        if type(v) == "number" then
+            V[norm(k)] = v
+        elseif type(v) == "table" then
+            if type(v.v) == "number" then V[norm(k)] = v.v end
+            if type(v.d) == "number" then DEM[norm(k)] = v.d end
+        end
     end
 end
 local function loadValues()
-    V = {}
+    V, DEM = {}, {}
+    for d, names in pairs(DEMAND_TIERS) do
+        for _, n in ipairs(names) do DEM[norm(n)] = d end
+    end
     mergeInto(BASE)
     mergeInto(C.CUSTOM_VALUES)
     if C.VALUES_URL ~= "" then
@@ -500,18 +564,32 @@ local function loadValues()
 end
 loadValues()
 
--- internal id -> display name overrides, e.g. ALIASES["InternalId"] = "Display name"
+-- internal id -> display name overrides
 local ALIASES = {
-    ["Scythe"] = "Batwing", -- guess; confirm in a test trade
-    ["ElderwoodKnife"] = "Elderwood Blade", -- seen in a real trade trace
-    ["ElderwoodGun"] = "Elderwood Revolver", -- guess from the knife pattern
+    ["Scythe"] = "Batwing",
+    ["ElderwoodKnife"] = "Elderwood Blade",
+    ["ElderwoodGun"] = "Elderwood Revolver",
 }
-local function val(name)
+local function dem(name)
+    name = tostring(name)
+    local d = DEM[norm(ALIASES[name] or name)]
+    if d then return d end
+    local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
+    return DEM[norm(ALIASES[stripped] or stripped)] or C.DEMAND_DEFAULT
+end
+local function val(name) -- raw value
     name = tostring(name)
     local v = V[norm(ALIASES[name] or name)]
     if v then return v end
     local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
     return V[norm(ALIASES[stripped] or stripped)] or 0
+end
+local function aval(name) -- demand-adjusted value
+    local raw = val(name)
+    if not C.USE_DEMAND or raw == 0 then return raw end
+    local d = dem(name)
+    if d > 8 then d = 8 end
+    return math.floor(raw * (C.DEMAND_MULT[d] or 1) + 0.5)
 end
 
 local unknownSeen = {}
@@ -617,7 +695,7 @@ local function cachedInventory(plr)
     return owned
 end
 
-local function offerable(id, v)
+local function offerable(id, v) -- v = RAW value
     if C.KEEP[id] or C.NEVER_OFFER[id] or v <= 0 then return false end
     if next(C.ONLY_OFFER) ~= nil then return C.ONLY_OFFER[id] == true end
     return v >= C.MIN_ITEM_OFFER and v <= C.MAX_ITEM_OFFER
@@ -629,11 +707,12 @@ local function myItems()
     local list, unknown = {}, {}
     for id, c in pairs(owned) do
         id = tostring(id)
-        local v = val(id)
-        if v == 0 and not C.KEEP[id] then unknown[#unknown + 1] = id end
-        if offerable(id, v) then
+        local raw = val(id)
+        if raw == 0 and not C.KEEP[id] then unknown[#unknown + 1] = id end
+        if offerable(id, raw) then
+            local av = aval(id)
             for _ = 1, math.min(tonumber(c) or 1, C.MAX_OFFER_ITEMS) do
-                list[#list + 1] = { id = id, v = v }
+                list[#list + 1] = { id = id, v = av, raw = raw }
             end
         end
     end
@@ -642,7 +721,7 @@ local function myItems()
     return list
 end
 
--- best bundle: highest total <= budget, then fewest items
+-- best bundle: highest (adjusted) total <= budget, then fewest items
 local function buildBundle(list, budget)
     local pool = {}
     for _, it in ipairs(list) do
@@ -679,10 +758,12 @@ local function pickDeal(theirOwned, mylist)
     local cands, unk = {}, {}
     for id in pairs(theirOwned) do
         id = tostring(id)
-        local vT = val(id)
-        if vT == 0 then unk[#unk + 1] = id end
-        if vT >= C.MIN_TARGET_VALUE and vT <= C.MAX_TARGET_VALUE then
-            cands[#cands + 1] = { id = id, v = vT }
+        local raw = val(id)
+        if raw == 0 then unk[#unk + 1] = id end
+        local d = dem(id)
+        if raw >= C.MIN_TARGET_VALUE and raw <= C.MAX_TARGET_VALUE
+            and (not C.USE_DEMAND or d >= C.MIN_TARGET_DEMAND) then
+            cands[#cands + 1] = { id = id, v = aval(id), raw = raw, d = d }
         end
     end
     if #unk > 0 then noteUnknown(unk, "theirs") end
@@ -695,7 +776,8 @@ local function pickDeal(theirOwned, mylist)
         if #bundle > 0 and tot >= budget * C.MIN_FILL and vT - tot >= C.MIN_PROFIT then
             local score = vT - tot
             if not best or score > best.score then
-                best = { item = cands[i].id, vT = vT, bundle = bundle, tot = tot, score = score }
+                best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
+                         bundle = bundle, tot = tot, score = score }
             end
         end
     end
@@ -730,10 +812,12 @@ local function markOff(plr)
 end
 
 ---------------- trade state ----------------
+-- curMineV/curTheirV = demand-adjusted (decisions), curMineR/curTheirR = raw (stats + notifications)
 local state = { target = nil, targetPlr = nil, bundle = nil, inTrade = false, completed = false,
                 latest = nil, lastSig = "", myAccepted = false, confirming = false,
                 theirCount = 0, bundleDone = nil, nudged = false,
-                curMineV = 0, curTheirV = 0, curMine = {}, curTheirs = {}, recorded = false }
+                curMineV = 0, curTheirV = 0, curMineR = 0, curTheirR = 0,
+                curMine = {}, curTheirs = {}, recorded = false }
 
 local addCount, lastAdd = 0, 0
 local function promptAdd(kind)
@@ -766,7 +850,8 @@ local function readOffers(data)
     return mine, theirs, other, myAcc
 end
 
-local function total(list) local t = 0 for _, n in ipairs(list) do t += val(n) end return t end
+local function total(list) local t = 0 for _, n in ipairs(list) do t += aval(n) end return t end -- adjusted
+local function rawTotal(list) local t = 0 for _, n in ipairs(list) do t += val(n) end return t end
 
 local function sameMultiset(a, b)
     if #a ~= #b then return false end
@@ -782,7 +867,8 @@ end
 local function resetTradeState()
     state.inTrade, state.completed, state.latest, state.lastSig, state.myAccepted = false, false, nil, "", false
     state.confirming, state.theirCount, state.bundleDone, state.nudged, state.recorded = false, 0, nil, false, false
-    state.curMineV, state.curTheirV, state.curMine, state.curTheirs = 0, 0, {}, {}
+    state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = 0, 0, 0, 0
+    state.curMine, state.curTheirs = {}, {}
     addCount, lastAdd = 0, 0
 end
 
@@ -809,7 +895,7 @@ if R.Start then
         for _, id in ipairs(state.bundle or {}) do
             if not state.inTrade then break end
             R.Offer:FireServer(id, "Weapons")
-            log("offered", id, "(" .. val(id) .. ")")
+            log("offered", id, "(" .. val(id) .. ", d" .. dem(id) .. ")")
             task.wait(0.6)
         end
         state.bundleDone = os.clock()
@@ -842,8 +928,10 @@ if R.Update then
         if sig == state.lastSig then return end
         state.lastSig = sig
         local mv, tv = total(mine), total(theirs)
-        state.curMineV, state.curTheirV, state.curMine, state.curTheirs = mv, tv, mine, theirs
-        log("mine(" .. mv .. "):", table.concat(mine, ","), "| theirs(" .. tv .. "):", table.concat(theirs, ","))
+        local mr, tr = rawTotal(mine), rawTotal(theirs)
+        state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = mv, tv, mr, tr
+        state.curMine, state.curTheirs = mine, theirs
+        log("mine(" .. mv .. "/" .. mr .. "):", table.concat(mine, ","), "| theirs(" .. tv .. "/" .. tr .. "):", table.concat(theirs, ","))
         local zero = {}
         for _, id in ipairs(theirs) do if val(id) == 0 then zero[#zero + 1] = id end end
         for _, id in ipairs(mine) do if val(id) == 0 then zero[#zero + 1] = id end end
@@ -859,7 +947,7 @@ if R.Update then
         task.wait(1.5)
         local m2, t2 = readOffers(state.latest)
         if state.inTrade and table.concat(m2, ",") .. "|" .. table.concat(t2, ",") == sig then
-            log("accepting: they give", tv, "for my", mv)
+            log("accepting: they give", tv, "for my", mv, "(raw " .. tr .. " / " .. mr .. ")")
             confirm()
         else
             log("offer changed, not confirming")
@@ -875,7 +963,7 @@ for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
                 state.completed = true
                 if state.target and not state.recorded then
                     state.recorded = true
-                    local g, t = state.curMineV, state.curTheirV
+                    local g, t = state.curMineR, state.curTheirR -- stats use raw values
                     S.trades += 1 S.given += g S.got += t
                     L.trades += 1 L.given += g L.got += t
                     saveJson(C.STATS_FILE, L)
@@ -884,9 +972,9 @@ for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
                         if val(id) >= C.BIG_VALUE then big[#big + 1] = id .. " (" .. val(id) .. ")" end
                     end
                     notify("trade", "Trade completed with " .. tostring(state.target),
-                        string.format("Got %d: %s\nGave %d: %s\nNet %+d | session net %+d",
+                        string.format("Got %d: %s\nGave %d: %s\nNet %+d (demand-adj %+d) | session net %+d",
                             t, table.concat(state.curTheirs, ", "), g, table.concat(state.curMine, ", "),
-                            t - g, S.got - S.given))
+                            t - g, state.curTheirV - state.curMineV, S.got - S.given))
                     if #big > 0 then
                         notify("big", "BIG HAUL from " .. tostring(state.target), table.concat(big, ", "))
                     end
@@ -916,7 +1004,8 @@ local function attempt(plr, deal)
     state.target, state.targetPlr, state.bundle = plr.Name, plr, deal.bundle
     resetTradeState()
     S.requests += 1
-    log("requesting", plr.Name, "for", deal.item, "(" .. deal.vT .. ") offering", table.concat(deal.bundle, "+"), "(" .. deal.tot .. ")")
+    log("requesting", plr.Name, "for", deal.item, "(adj " .. deal.vT .. ", raw " .. deal.raw .. ", d" .. deal.d .. ") offering",
+        table.concat(deal.bundle, "+"), "(adj " .. deal.tot .. ")")
     local sendDone, sendRes = false, nil
     task.spawn(function()
         local ok, res = pcall(function() return R.Send:InvokeServer(plr) end)
@@ -1172,7 +1261,7 @@ local function runCycle()
     end
     local parts = {}
     for i = 1, math.min(#mylist, 6) do parts[#parts + 1] = mylist[i].id .. "(" .. mylist[i].v .. ")" end
-    log("my items:", #mylist, "|", table.concat(parts, ", "))
+    log("my items:", #mylist, "(adj) |", table.concat(parts, ", "))
 
     local cands = {}
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -1237,7 +1326,8 @@ if C.SUMMARY_MINUTES > 0 then
 end
 
 task.spawn(function()
-    log("v8.0 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN)
+    log("v8.1 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
+        "| demand", C.USE_DEMAND and ("on, min target d" .. C.MIN_TARGET_DEMAND) or "off")
     notify("start", "Trader started", "gain " .. C.MIN_GAIN .. " | " .. (C.ONLY_PLAYER ~= "" and ("only " .. C.ONLY_PLAYER) or "everyone"))
     local errs = 0
     while not stopped do
