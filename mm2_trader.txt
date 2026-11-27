@@ -1,80 +1,674 @@
--- MM2 Trader v8.3 -> v8.3.1 patch loader
--- Run THIS instead of the v8.3 script. It reads mm2_trader.txt from your executor
--- workspace (run v8.3 once first so that file exists), applies the fixes below,
--- saves the patched file back (so server hops re-run the patched version), and starts it.
---
--- Fixes:
---  1. Inventory reading: 2 tries per player, and the log says WHY it failed
---     (no reply / userId mismatch / no Weapons.Owned).
---  2. Offers: after the bundle is offered it checks the trade, and re-offers anything
---     that didn't land (up to 3 rounds). Before, a dropped offer just stalled the trade.
---  3. Accept: if the deal is good but my accept never registered, it retries the
---     confirm (up to 3 times, 6s apart) instead of sitting there until timeout.
---  4. Safer defaults: no mass-blocking, no auto "add more" chat, and the Telegram
---     token/chat id are removed from the file (put them in mm2_secrets.json).
+-- MM2 Trader v8.3.1 — full script (v8.3 + reliability fixes, safer defaults)
+-- Run this file directly. It saves itself as mm2_trader.txt in your executor
+-- workspace so server hops can re-run it.
+local src = [==[
+--[[
+  MM2 Auto Trader v8.3.1
+  - Grinder config (MIN_ITEM_OFFER=15, MIN_TARGET_DEMAND=3, UPFRONT_GODLYS=false)
+  - LIQUIDITY_GUARD: never trade 1 liquid item for 1 low-demand item
+  - v8.3.1: inventory reads retry and log the failure reason
+  - v8.3.1: re-offers items that didn't land; retries confirm if accept didn't register
+  - v8.3.1: safer defaults (no mass-blocking, no auto chat, no token in file)
+  - Put Telegram/Discord secrets in mm2_secrets.json:
+      {"tg_token":"...","tg_chat":"...","discord_webhook":"...","discord_ping":"..."}
+  - In-game CONFIG editor panel, saves to mm2_config.json
+]]
 
-local FILE = "mm2_trader.txt"
-local MARK = "-- PATCHED831"
+---------------- CONFIG ----------------
+local C = {
+    MIN_GAIN         = 1.15,
+    MIN_PROFIT       = 1,
+    MAX_OFFER_ITEMS  = 4,
+    MIN_FILL         = 0.6,
+    MIN_TARGET_VALUE = 10,
+    MAX_TARGET_VALUE = math.huge,
+    MAX_ITEM_OFFER   = math.huge,
+    MIN_ITEM_OFFER   = 15,
+    NEVER_OFFER      = {},
+    ONLY_OFFER       = {},
+    MAX_TRADE_RISK   = math.huge,
+    CANDIDATES       = 12,
+    POOL_LIMIT       = 32,
+    ONLY_PLAYER      = "",
+    SKIP_FRIENDS     = true,
+    SKIP_PLAYERS     = {},
+    KEEP             = { DefaultGun = true, DefaultKnife = true },
 
-if not (readfile and writefile and isfile and isfile(FILE)) then
-    warn("mm2_trader.txt not found in workspace. Run the v8.3 script once first.")
-    return
+    USE_DEMAND        = true,
+    MIN_TARGET_DEMAND = 3,
+    DEMAND_DEFAULT    = 4,
+    DEMAND_MULT      = { [1]=0.70,[2]=0.85,[3]=0.95,[4]=1.00,[5]=1.05,[6]=1.10,[7]=1.15,[8]=1.20 },
+
+    LIQUIDITY_GUARD  = true,
+    LIQUIDITY_MIN_D  = 3,
+
+    UPFRONT_GODLYS    = false,
+    UPFRONT_MAX       = 4,
+    GODLY_INCLUDE_CHROMA = false,
+    GODLY_EXTRA       = {},
+    REMOVE_REMOTE     = "",
+    REMOVE_WITH_TYPE  = true,
+    MAX_SYNCS         = 6,
+
+    CUSTOM_VALUES    = {},
+    VALUES_FILE      = "mm2_values.json",
+    VALUES_URL       = "",
+    VALUES_REFRESH   = 1800,
+
+    REQUEST_TIMEOUT  = 25,
+    TRADE_TIMEOUT    = 60,
+    IDLE_NUDGE       = 12,
+    IDLE_DECLINE     = 30,
+    PLAYER_COOLDOWN  = 180,
+    MAX_COOLDOWN     = 1800,
+    INV_TTL          = 120,
+    SCAN_STAGGER     = 0.15,
+    BLACKLIST_AFTER  = 3,
+    BLACKLIST_SECS   = 21600,
+    BLOCK_NON_FRIENDS = false,
+    BLOCK_MAX        = 900,
+    REATTEMPT_SECS   = 1800,
+    STALE_RATIO      = 0.5,
+    OFF_COOLDOWN     = 3600,
+
+    SERVER_HOP       = true,
+    HOP_MIN_PLAYERS  = 4,
+
+    SCRIPT_FILE      = "mm2_trader.txt",
+    VISITED_FILE     = "mm2_visited.json",
+    PLAYERS_FILE     = "mm2_players.json",
+    SEEN_FILE        = "mm2_seen.json",
+    STATS_FILE       = "mm2_stats.json",
+    UNKNOWN_FILE     = "mm2_unknown.txt",
+    LOG_FILE         = "mm2_trader_log.txt",
+    CONFIG_FILE      = "mm2_config.json",
+    SECRETS_FILE     = "mm2_secrets.json",
+
+    DISCORD_WEBHOOK  = "",
+    DISCORD_PING_ID  = "",
+    TG_TOKEN         = "",
+    TG_CHAT          = "",
+    BIG_VALUE        = 500,
+    SUMMARY_MINUTES  = 30,
+    NOTIFY = { start=false, trade=true, big=false, hop=false, error=false,
+               summary=false, stop=false, unknown=false },
+
+    ACCEPT_VARIANTS  = { "LASTOFFER", 570 },
+    SPY              = true,
+    CHAT_ADD         = false,
+    MAX_ADD_PROMPTS  = 3,
+    ADD_COOLDOWN     = 8,
+    CHAT_MIN_GAP     = 5,
+    ADD_LOW          = { "add", "add more pls", "need more", "add more" },
+    ADD_FAIR         = { "add a bit more", "almost, add a bit", "so close" },
+}
+
+local BASE = {
+    ["Corrupt"]=230,["Gingerscope"]=16000,["Traveler's Axe"]=6600,["Celestial"]=2075,
+    ["Vampire's Axe"]=1050,["Emberbow"]=525,["Emberscythe"]=525,["Harvester"]=320,
+    ["Icepiercer"]=230,["Icebreaker"]=65,["Batwing"]=40,["Elderwood Scythe"]=35,
+    ["Swirly Axe"]=35,["Hallowscythe"]=30,["Log Chopper"]=17,["Icewing"]=13,
+    ["Chroma Traveler's Gun"]=140000,["Chroma Evergun"]=55000,["Chroma Evergreen"]=44000,
+    ["Chroma Bauble"]=31000,["Chroma Constellation"]=27500,["Chroma Vampire's Gun"]=23500,
+    ["Chroma Alienbeam"]=18500,["Chroma Raygun"]=12500,["Chroma Sunrise"]=8500,
+    ["Chroma Snowcannon"]=7750,["Chroma Blizzard"]=5500,["Chroma Sunset"]=5500,
+    ["Chroma Emberscythe"]=5250,["Chroma Emberbow"]=5000,["Chroma Snowstorm"]=4250,
+    ["Chroma Heart Wand"]=3500,["Chroma Snow Dagger"]=2350,["Chroma Watergun"]=2300,
+    ["Chroma Ornament"]=1825,["Chroma Treat"]=1775,["Chroma Sweet"]=1725,
+    ["Chroma Embersickle"]=1650,["Chroma Immortal"]=1550,["Chroma Mortal"]=1550,
+    ["Chroma Icecream"]=1525,["Chroma Sands"]=850,["Chroma Beachy"]=800,
+    ["Chroma Darkbringer"]=65,["Chroma Lightbringer"]=60,["Chroma Luger"]=50,
+    ["Chroma Candleflame"]=40,["Chroma Laser"]=40,["Chroma Elderwood Blade"]=37,
+    ["Chroma Swirly Gun"]=35,["Chroma Deathshard"]=33,["Chroma Cookiecane"]=32,
+    ["Chroma Fang"]=32,["Chroma Gemstone"]=32,["Chroma Shark"]=32,["Chroma Slasher"]=30,
+    ["Chroma Heat"]=28,["Chroma Seer"]=27,["Chroma Tides"]=27,["Chroma Gingerblade"]=25,
+    ["Chroma Saw"]=23,["Chroma Boneblade"]=22,
+    ["Chroma Fire Bat"]=3,["Chroma Fire Bear"]=3,["Chroma Fire Bunny"]=3,
+    ["Chroma Fire Cat"]=3,["Chroma Fire Dog"]=3,["Chroma Fire Fox"]=3,["Chroma Fire Pig"]=3,
+    ["Traveler's Gun"]=4300,["Evergun"]=3625,["Evergreen"]=3000,["Constellation"]=2550,
+    ["Turkey"]=1950,["Alienbeam"]=1875,["Raygun"]=1850,["Vampire's Gun"]=1800,
+    ["Darkshot"]=1450,["Darksword"]=1425,["Blossom"]=1160,["Sakura"]=1150,
+    ["Snowcannon"]=900,["Bauble"]=825,["Sunrise"]=800,
+    ["Latte (Gun)"]=140,["Latte (Knife)"]=140,["Spectral (Knife)"]=50,["Traveler (Gun)"]=50,
+    ["Aurora (Gun)"]=45,["Vampire (Gun)"]=45,["Beach"]=35,["Cotton Candy"]=35,["JD"]=27,
+    ["Bunnies"]=15,["Arctic (Gun)"]=10,["Golden"]=10,["Shadow"]=10,["Cavern (Knife)"]=7,
+    ["Broken"]=7,["Icedriller"]=5,["Nightsky"]=5,["Ghost (Knife)"]=5,["Ginger (Gun)"]=5,
+    ["Aurora (Knife)"]=3,["Spectral (Gun)"]=3,["Traveler (Knife)"]=3,["Vampire (Knife)"]=3,
+    ["Witched"]=3,["Blue Elite"]=3,["Green Elite"]=3,["Red Scratch"]=3,["Santa's Magic"]=3,
+    ["Cane (Knife)"]=500,["Dungeon"]=110,["Darkknife"]=65,["Silent Night (Knife)"]=50,
+    ["Makeshift (Knife)"]=35,["Zombified"]=30,["Starry (Gun)"]=22,["Swirl"]=20,
+    ["Watcher (Gun)"]=20,["Magma (Gun)"]=13,["Silent Night (Gun)"]=12,["Snowflakes"]=12,
+    ["Cowboy"]=10,["Floral (Knife)"]=10,["Ghostfire"]=10,["Laser"]=10,["Phaser"]=10,["Prince"]=10,
+    ["Bones"]=210,["Brains"]=130,["Zombified (Knife)"]=120,["Gingerbread (Knife) 2019"]=85,
+    ["Sweater (Knife)"]=60,["Snowflake (Knife)"]=55,["Branches"]=45,["Mummy (2017)"]=25,
+    ["Skulls"]=15,["Zombified (Gun)"]=15,["Void"]=12,["Wrap (Gun)"]=12,["Wrap (Knife)"]=12,
+    ["Gingerbread (Knife) 2020"]=10,["Ghost"]=10,["Steel (Gun)"]=8,["Zombie"]=10,
+    ["Gothic (Gun)"]=5,["Snowman (Gun) 2021"]=5,["Hazard (Gun)"]=5,["Zombie (Gun)"]=5,
+    ["Bats (Knife)"]=230,["Bats (Knife) [HALLOWS2018]"]=230,["Gifts (Knife)"]=95,
+    ["Ghoulish"]=90,["Pine (Knife)"]=85,["Mummified"]=35,["Frosted (Knife)"]=30,
+    ["Snowflakes (Gun)"]=30,["Wrapped (Gun)"]=30,["Sparkle9"]=30,["Webbed (Gun)"]=25,
+    ["Snowman (Gun)"]=22,["CandyCorn (2017)"]=22,["Ecto"]=22,["Elf (2018)"]=20,
+    ["Slimy"]=20,["Sparkle10"]=20,["Sparkle8"]=20,["Sparkle7"]=18,["RIP"]=17,
+    ["Coal (Knife)"]=15,["Elf (Knife)"]=15,["Candy Corn (2019)"]=12,["Pumpkin (2019)"]=12,
+    ["Prism"]=12,["Sparkle6"]=12,["Combat II"]=10,["Sparkle4"]=10,["Phantom"]=10,
+    ["Zombie Dog"]=725,["Elf (2019)"]=600,["Blue Pumpkin"]=220,["Blue Pumpkin (2018)"]=220,
+    ["Dogey"]=140,["Red Pumpkin"]=120,["Red Pumpkin (2018)"]=120,["Black Cat"]=75,
+    ["Green Pumpkin"]=60,["Piggy"]=55,["Pumpkin (2017)"]=50,["Nebula"]=16,
+    ["Scarytree_K_2026"]=1,["HauntedHouse_K_2026"]=1,["Skelly_K_2026"]=1,["Drool_K_2026"]=1,
+    ["Drool_G_2026"]=1,["Wolf_G_2026"]=1,["Glow_G_2026"]=1,["Bombs_G_2026"]=1,
+    ["Brew_K_2026"]=1,["Bramble_G_2026"]=1,["Hexed_K_2026"]=1,["Skulls_K_2026"]=2,
+    ["Embergun_G_2026"]=9,["Emberknife"]=3,["Emberknife_K_2026"]=3,
+    ["CandyCorn_K_2026"]=1,["CandyCorn_G_2026"]=1,["Bullets_K_2026"]=1,
+    ["Sunset"]=650,["Soul"]=480,["Spirit"]=470,["Xenoshot"]=400,["Xenoknife"]=400,
+    ["Rainbow Gun"]=405,["Flora"]=400,["Rainbow"]=400,["Bloom"]=395,["Heart Wand"]=340,
+    ["Blizzard"]=250,["Snowstorm"]=250,["Ocean"]=240,["Flowerwood Gun"]=240,["Waves"]=235,
+    ["Flowerwood"]=235,["Flowerwood Knife"]=235,["Snow Dagger"]=165,["Treat"]=155,
+    ["Icecream"]=130,["WaterGun"]=130,["Watergun"]=130,["Sweet"]=150,["Mortal"]=120,["Immortal"]=120,
+    ["Borealis"]=130,["Australis"]=125,["Bat"]=160,["Embersickle"]=125,
+    ["Candy"]=95,["Pearlshine"]=80,["Beachy"]=65,["Sands"]=65,
+    ["Pearl"]=75,["Heartblade"]=65,["Ornament"]=65,
+    ["Red Luger"]=38,["Spectre"]=37,["Candleflame"]=35,
+    ["Elderwood Revolver"]=35,["Darkbringer"]=35,["Iceblaster"]=35,["Sugar"]=33,
+    ["Makeshift"]=33,["Lightbringer"]=33,["Elderwood Blade"]=32,
+    ["Green Luger"]=25,["Amerilaser"]=23,["Hallowgun"]=22,["Icebeam"]=20,["Shark"]=20,
+    ["Plasmabeam"]=20,["Night Blade"]=20,["Swirlygun"]=18,["Iceflake"]=18,
+    ["Battle Axe II"]=18,["Pixel"]=18,["Ginger Luger"]=18,["Old Glory"]=17,["Blaster"]=17,
+    ["Luger"]=17,["Plasmablade"]=17,
+    ["Virtual"]=15,["Slasher"]=15,["Minty"]=15,["Luger Cane"]=15,["Vampire's Edge"]=15,
+    ["Jinglegun"]=15,["Cookiecane"]=14,["Gingermint"]=14,["Swirlyblade"]=13,
+    ["Death Shard"]=13,["BattleAxe"]=13,["Gingerblade"]=13,["Eternal Cane"]=13,
+    ["Gemstone"]=13,["Chill"]=12,["Clockwork"]=12,["Spider"]=12,["Heat"]=12,["Tides"]=12,
+    ["Fang"]=12,["Eternal"]=10,["Xmas"]=10,["Frostsaber"]=10,["Eternal III"]=10,
+    ["Eternal3"]=10,["Bioblade"]=10,["Eternal IV"]=10,["Eternal4"]=10,
+    ["Handsaw"]=9,["Hallow's Edge"]=9,["Ice Shard"]=9,["Eternal II"]=8,["Eternal2"]=8,
+    ["Boneblade"]=8,["Pumpking"]=8,["Saw"]=8,["Ghost Blade"]=8,["Flames"]=7,
+    ["Winter's Edge"]=7,["Ice Dragon"]=7,["Hallow's Blade"]=7,["Frostbite"]=7,
+    ["Eggblade"]=5,["Snowflake"]=5,["Prismatic"]=5,["Peppermint"]=4,["Cookieblade"]=4,
+    ["Red Seer"]=3,["Blue Seer"]=3,["Purple Seer"]=3,["Seer"]=3,["Orange Seer"]=2,["Yellow Seer"]=2,
+}
+
+local DEMAND_TIERS = {
+    [11] = { "Nik's Scythe" },
+    [8] = { "Chroma Traveler's Gun" },
+    [7] = { "Chroma Evergun", "Chroma Evergreen", "Chroma Bauble" },
+    [6] = { "Celestial", "Chroma Constellation", "Chroma Vampire's Gun", "Chroma Alienbeam",
+            "Evergun", "Evergreen", "Constellation", "Bauble" },
+    [5] = { "Gingerscope", "Traveler's Axe", "Vampire's Axe", "Emberbow", "Emberscythe",
+            "Chroma Raygun", "Chroma Sunrise", "Chroma Snowcannon", "Chroma Blizzard", "Chroma Sunset",
+            "Chroma Emberscythe", "Chroma Emberbow", "Chroma Snowstorm", "Chroma Heart Wand",
+            "Chroma Snow Dagger", "Chroma Watergun", "Chroma Ornament", "Chroma Treat", "Chroma Sweet",
+            "Chroma Embersickle", "Chroma Immortal", "Chroma Mortal", "Chroma Icecream", "Chroma Sands",
+            "Chroma Beachy", "Traveler's Gun", "Turkey", "Alienbeam", "Raygun", "Vampire's Gun",
+            "Darkshot", "Darksword", "Blossom", "Sakura", "Snowcannon", "Sunrise", "Sunset", "Soul", "Spirit" },
+    [4] = { "Harvester", "Icepiercer", "Rainbow Gun", "Flora", "Rainbow", "Xenoknife", "Xenoshot",
+            "Bloom", "Heart Wand", "Cane (Knife)", "Zombie Dog", "Elf (2019)" },
+    [3] = { "Corrupt", "Blizzard", "Snowstorm", "Flowerwood Gun", "Ocean", "Flowerwood", "Flowerwood Knife",
+            "Waves", "Snow Dagger", "Bat", "Treat", "Sweet", "Mortal", "Immortal", "Icecream", "Watergun",
+            "Borealis", "Australis", "Latte (Gun)", "Latte (Knife)", "Bones", "Bats (Knife)",
+            "Bats (Knife) [HALLOWS2018]", "Blue Pumpkin", "Blue Pumpkin (2018)" },
+    [2] = { "Embersickle", "Candy", "Pearlshine", "Pearl", "Beachy", "Sands", "Heartblade", "Ornament",
+            "Spectral (Knife)", "Traveler (Gun)", "Aurora (Gun)", "Vampire (Gun)", "Beach", "Cotton Candy",
+            "JD", "Bunnies", "Arctic (Gun)", "Golden", "Shadow", "Cavern (Knife)", "Broken", "Icedriller",
+            "Nightsky", "Emberknife", "Emberknife_K_2026", "Embergun_G_2026", "Skulls_K_2026",
+            "Dungeon", "Darkknife", "Silent Night (Knife)", "Makeshift (Knife)", "Zombified", "Starry (Gun)",
+            "Swirl", "Watcher (Gun)", "Magma (Gun)", "Silent Night (Gun)", "Snowflakes", "Cowboy",
+            "Floral (Knife)", "Ghostfire", "Laser", "Phaser", "Prince", "Brains", "Zombified (Knife)",
+            "Gingerbread (Knife) 2019", "Sweater (Knife)", "Snowflake (Knife)", "Branches", "Mummy (2017)",
+            "Skulls", "Zombified (Gun)", "Void", "Wrap (Gun)", "Wrap (Knife)", "Gingerbread (Knife) 2020",
+            "Ghost", "Gifts (Knife)", "Ghoulish", "Pine (Knife)", "Mummified", "Frosted (Knife)",
+            "Snowflakes (Gun)", "Wrapped (Gun)", "Sparkle9", "Webbed (Gun)", "Snowman (Gun)",
+            "CandyCorn (2017)", "Ecto", "Elf (2018)", "Slimy", "Sparkle10", "Sparkle8", "Sparkle7", "RIP",
+            "Coal (Knife)", "Elf (Knife)", "Candy Corn (2019)", "Pumpkin (2019)", "Prism", "Sparkle6",
+            "Combat II", "Phantom", "Zombie", "Sparkle4", "Dogey", "Red Pumpkin", "Red Pumpkin (2018)",
+            "Black Cat", "Green Pumpkin", "Piggy", "Pumpkin (2017)", "Elderwood Blade", "Elderwood Revolver" },
+    [1] = { "Icebreaker", "Batwing", "Elderwood Scythe", "Swirly Axe", "Hallowscythe", "Log Chopper", "Icewing",
+            "Chroma Darkbringer", "Chroma Lightbringer", "Chroma Luger", "Chroma Candleflame", "Chroma Laser",
+            "Chroma Elderwood Blade", "Chroma Swirly Gun", "Chroma Deathshard", "Chroma Cookiecane",
+            "Chroma Fang", "Chroma Gemstone", "Chroma Shark", "Chroma Slasher", "Chroma Heat", "Chroma Seer",
+            "Chroma Tides", "Chroma Gingerblade", "Chroma Saw", "Chroma Boneblade",
+            "Chroma Fire Bat", "Chroma Fire Bear", "Chroma Fire Bunny", "Chroma Fire Cat", "Chroma Fire Dog",
+            "Chroma Fire Fox", "Chroma Fire Pig", "Ghost (Knife)", "Ginger (Gun)",
+            "Scarytree_K_2026", "HauntedHouse_K_2026", "Skelly_K_2026", "Drool_K_2026", "Drool_G_2026",
+            "Wolf_G_2026", "Glow_G_2026", "Bombs_G_2026", "Brew_K_2026", "Bramble_G_2026", "Hexed_K_2026" },
+}
+
+local Players         = game:GetService("Players")
+local RS              = game:GetService("ReplicatedStorage")
+local HttpService     = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local UIS             = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+local VU              = game:GetService("VirtualUser")
+local me              = Players.LocalPlayer
+local CG = (gethui and gethui()) or game:GetService("CoreGui")
+
+local S = { trades = 0, given = 0, got = 0, requests = 0, declined = 0, hops = 0, started = os.clock() }
+
+local httpReq = request or http_request or (syn and syn.request) or (http and http.request)
+
+local function loadJson(path)
+    if path ~= "" and isfile and readfile and isfile(path) then
+        local ok, t = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+        if ok and type(t) == "table" then return t end
+    end
+    return {}
+end
+local function saveJson(path, t)
+    if path ~= "" and writefile then
+        pcall(function() writefile(path, HttpService:JSONEncode(t)) end)
+    end
+end
+local function httpGet(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and body then return body end
+    if httpReq then
+        local ok2, res = pcall(httpReq, { Url = url, Method = "GET" })
+        if ok2 and res and res.Body then return res.Body end
+    end
+    return nil
 end
 
-local raw = readfile(FILE)
-local inner = raw
 do
-    local open = "local src = [==["
-    local a = raw:find(open, 1, true)
-    if a then
-        local s = a + #open
-        local e = raw:find("]==]", s, true)
-        if e then inner = raw:sub(s, e - 1) end
+    local s = loadJson(C.SECRETS_FILE)
+    if s.tg_token        then C.TG_TOKEN        = s.tg_token end
+    if s.tg_chat         then C.TG_CHAT         = tostring(s.tg_chat) end
+    if s.discord_webhook then C.DISCORD_WEBHOOK = s.discord_webhook end
+    if s.discord_ping    then C.DISCORD_PING_ID = tostring(s.discord_ping) end
+end
+
+local L = loadJson(C.STATS_FILE)
+L.trades, L.given, L.got, L.hops = L.trades or 0, L.given or 0, L.got or 0, L.hops or 0
+
+---------------- UI ----------------
+local lines = {}
+local oldGui = CG:FindFirstChild("MM2Trader")
+if oldGui then oldGui:Destroy() end
+local gui = Instance.new("ScreenGui")
+gui.Name = "MM2Trader"
+gui.ResetOnSpawn = false
+gui.Parent = CG
+local W, H = 300, 240
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(W, H)
+frame.Position = UDim2.fromOffset(8, 60)
+frame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+frame.BackgroundTransparency = 0.05
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 26)
+header.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+header.BorderSizePixel = 0
+header.Parent = frame
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+local function mkBtn(text, x, w, color, parent)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w, 22)
+    b.Position = UDim2.fromOffset(x, 2)
+    b.Text, b.TextSize, b.Font = text, 10, Enum.Font.GothamBold
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.BackgroundColor3 = color
+    b.BorderSizePixel = 0
+    b.Parent = parent or header
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    return b
+end
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -190, 1, 0)
+title.Position = UDim2.fromOffset(8, 0)
+title.BackgroundTransparency = 1
+title.Text = "MM2 Trader v8.3.1"
+title.TextSize = 12
+title.Font = Enum.Font.GothamBold
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+local pauseBtn = mkBtn("PAUSE", W - 176, 58, Color3.fromRGB(200, 140, 40))
+local copyBtn = mkBtn("COPY", W - 114, 50, Color3.fromRGB(60, 150, 90))
+local minBtn = mkBtn("-", W - 60, 26, Color3.fromRGB(80, 80, 90))
+local closeBtn = mkBtn("X", W - 30, 24, Color3.fromRGB(180, 60, 60))
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -12, 0, 26)
+status.Position = UDim2.fromOffset(6, 28)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(140, 220, 160)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.TextWrapped = true
+status.TextSize = 10
+status.Font = Enum.Font.Code
+status.Parent = frame
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -12, 1, -60)
+scroll.Position = UDim2.fromOffset(6, 54)
+scroll.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.CanvasSize = UDim2.new()
+scroll.Parent = frame
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(1, -6, 0, 0)
+label.AutomaticSize = Enum.AutomaticSize.Y
+label.BackgroundTransparency = 1
+label.TextColor3 = Color3.fromRGB(230, 230, 230)
+label.TextXAlignment = Enum.TextXAlignment.Left
+label.TextYAlignment = Enum.TextYAlignment.Top
+label.TextWrapped = true
+label.TextSize = 10
+label.Font = Enum.Font.Code
+label.Parent = scroll
+
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging, dragStart, startPos = true, i.Position, frame.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
+        local d = i.Position - dragStart
+        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+local minimized, stopped, paused = false, false, false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    scroll.Visible, status.Visible = not minimized, not minimized
+    frame.Size = minimized and UDim2.fromOffset(W, 26) or UDim2.fromOffset(W, H)
+end)
+closeBtn.MouseButton1Click:Connect(function() stopped = true gui:Destroy() end)
+pauseBtn.MouseButton1Click:Connect(function()
+    paused = not paused
+    pauseBtn.Text = paused and "RESUME" or "PAUSE"
+    pauseBtn.BackgroundColor3 = paused and Color3.fromRGB(60, 150, 90) or Color3.fromRGB(200, 140, 40)
+end)
+copyBtn.MouseButton1Click:Connect(function()
+    if setclipboard then setclipboard(table.concat(lines, "\n")) copyBtn.Text = "DONE" else copyBtn.Text = "NO CLIP" end
+    task.delay(1.2, function() copyBtn.Text = "COPY" end)
+end)
+
+local function refreshStatus()
+    if not status.Parent then return end
+    local mins = math.floor((os.clock() - S.started) / 60)
+    status.Text = string.format("trades %d | req %d | net %+d (in %d / out %d)\nhops %d | up %dm | declined %d%s",
+        S.trades, S.requests, S.got - S.given, S.got, S.given, S.hops, mins, S.declined, paused and " | PAUSED" or "")
+end
+
+local function log(...)
+    local parts = {}
+    for _, v in ipairs({...}) do parts[#parts + 1] = tostring(v) end
+    local s = table.concat(parts, " ")
+    if #s > 200 then s = s:sub(1, 200) .. "..." end
+    print("[MM2Trader]", s)
+    lines[#lines + 1] = s
+    if #lines > 250 then table.remove(lines, 1) end
+    if label.Parent then
+        label.Text = table.concat(lines, "\n")
+        scroll.CanvasPosition = Vector2.new(0, 1e6)
+    end
+    if C.LOG_FILE ~= "" and appendfile then
+        pcall(appendfile, C.LOG_FILE, os.date("%H:%M:%S ") .. s .. "\n")
+    end
+    refreshStatus()
+end
+
+local function dump(v, d)
+    d = d or 0
+    if d > 2 then return "..." end
+    if typeof(v) == "table" then
+        local out, n = {}, 0
+        for k, x in pairs(v) do
+            n += 1
+            if n > 8 then out[#out + 1] = "..." break end
+            out[#out + 1] = tostring(k) .. "=" .. dump(x, d + 1)
+        end
+        return "{" .. table.concat(out, ",") .. "}"
+    end
+    return tostring(v)
+end
+
+---------------- notifications (Discord + Telegram) ----------------
+local COLORS = { trade = 0x2ecc71, big = 0xf1c40f, error = 0xe74c3c, stop = 0xe67e22,
+                 summary = 0x3498db, start = 0x9b59b6, hop = 0x95a5a6, unknown = 0x7f8c8d }
+local outbox = {}
+local function notify(kind, head, text)
+    if not C.NOTIFY[kind] then return end
+    if C.DISCORD_WEBHOOK == "" and C.TG_TOKEN == "" then return end
+    if #outbox > 30 then table.remove(outbox, 1) end
+    outbox[#outbox + 1] = { kind = kind, head = head, text = text or "" }
+end
+
+task.spawn(function()
+    while true do
+        local m = table.remove(outbox, 1)
+        if not m then
+            task.wait(0.5)
+        else
+            local who = me.Name
+            if httpReq and C.DISCORD_WEBHOOK ~= "" then
+                local ping = ""
+                if C.DISCORD_PING_ID ~= "" and (m.kind == "big" or m.kind == "error" or m.kind == "stop") then
+                    ping = "<@" .. C.DISCORD_PING_ID .. ">"
+                end
+                pcall(httpReq, {
+                    Url = C.DISCORD_WEBHOOK, Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode({
+                        username = "MM2 Trader", content = ping,
+                        embeds = {{ title = m.head, description = m.text:sub(1, 3900),
+                                    color = COLORS[m.kind] or 0x3498db, footer = { text = who } }},
+                    }),
+                })
+            end
+            if httpReq and C.TG_TOKEN ~= "" and C.TG_CHAT ~= "" then
+                pcall(httpReq, {
+                    Url = "https://api.telegram.org/bot" .. C.TG_TOKEN .. "/sendMessage", Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode({
+                        chat_id = C.TG_CHAT, text = (m.head .. "\n" .. m.text .. "\n[" .. who .. "]"):sub(1, 4000),
+                    }),
+                })
+            end
+            task.wait(1.3)
+        end
+    end
+end)
+
+---------------- utilities ----------------
+me.Idled:Connect(function()
+    pcall(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end)
+end)
+
+local lastChat = 0
+local function say(msg)
+    if os.clock() - lastChat < C.CHAT_MIN_GAP then return false end
+    lastChat = os.clock()
+    pcall(function()
+        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+            local ch = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+            if ch then ch:SendAsync(msg) return end
+        end
+        local ev = RS:FindFirstChild("DefaultChatSystemChatEvents")
+        local req = ev and ev:FindFirstChild("SayMessageRequest")
+        if req then req:FireServer(msg, "All") end
+    end)
+    return true
+end
+
+local function shuffle(t)
+    for i = #t, 2, -1 do
+        local j = math.random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+    return t
+end
+
+local function queueScript()
+    if queue_on_teleport and isfile and isfile(C.SCRIPT_FILE) then
+        queue_on_teleport(readfile(C.SCRIPT_FILE))
+        return true
+    end
+    log("script will NOT auto-restart (save it as " .. C.SCRIPT_FILE .. ")")
+    return false
+end
+
+---------------- values + demand ----------------
+local function norm(s) return (tostring(s):lower():gsub("[^%w]", "")) end
+local V, DEM = {}, {}
+local function mergeInto(t)
+    for k, v in pairs(t) do
+        if type(v) == "number" then
+            V[norm(k)] = v
+        elseif type(v) == "table" then
+            if type(v.v) == "number" then V[norm(k)] = v.v end
+            if type(v.d) == "number" then DEM[norm(k)] = v.d end
+        end
+    end
+end
+local function loadValues()
+    V, DEM = {}, {}
+    for d, names in pairs(DEMAND_TIERS) do
+        for _, n in ipairs(names) do DEM[norm(n)] = d end
+    end
+    mergeInto(BASE)
+    mergeInto(C.CUSTOM_VALUES)
+    if C.VALUES_URL ~= "" then
+        local body = httpGet(C.VALUES_URL)
+        if body then
+            local ok, t = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok and type(t) == "table" then mergeInto(t) log("values: url loaded") else log("values: url bad json") end
+        else
+            log("values: url fetch failed")
+        end
+    end
+    mergeInto(loadJson(C.VALUES_FILE))
+end
+loadValues()
+
+local ALIASES = {
+    ["Scythe"] = "Batwing",
+    ["ElderwoodKnife"] = "Elderwood Blade",
+    ["ElderwoodGun"] = "Elderwood Revolver",
+}
+local function dem(name)
+    name = tostring(name)
+    local d = DEM[norm(ALIASES[name] or name)]
+    if d then return d end
+    local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
+    return DEM[norm(ALIASES[stripped] or stripped)] or C.DEMAND_DEFAULT
+end
+local function val(name)
+    name = tostring(name)
+    local v = V[norm(ALIASES[name] or name)]
+    if v then return v end
+    local stripped = name:gsub("_[KG]_%d+$", ""):gsub("_[KG]$", "")
+    return V[norm(ALIASES[stripped] or stripped)] or 0
+end
+local function aval(name)
+    local raw = val(name)
+    if not C.USE_DEMAND or raw == 0 then return raw end
+    local d = dem(name)
+    if d > 8 then d = 8 end
+    return math.floor(raw * (C.DEMAND_MULT[d] or 1) + 0.5)
+end
+
+local unknownSeen = {}
+local function noteUnknown(ids, who)
+    local fresh = {}
+    for _, id in ipairs(ids) do
+        if not unknownSeen[id] then
+            unknownSeen[id] = true
+            fresh[#fresh + 1] = id
+            if C.UNKNOWN_FILE ~= "" and appendfile then
+                pcall(appendfile, C.UNKNOWN_FILE, id .. "  (" .. who .. ")\n")
+            end
+        end
+    end
+    if #fresh > 0 and who ~= "theirs" then
+        log("no value for:", table.concat(fresh, ", "))
+        notify("unknown", "Items with no value", table.concat(fresh, ", "))
     end
 end
 
-local original = inner
-local report = {}
-
-local function findOnce(anchor)
-    local i, j = inner:find(anchor, 1, true)
-    if not i then return nil end
-    if inner:find(anchor, j + 1, true) then return nil, "anchor not unique" end
-    return i, j
+if C.VALUES_URL ~= "" and C.VALUES_REFRESH > 0 then
+    task.spawn(function()
+        while not stopped do
+            task.wait(C.VALUES_REFRESH)
+            loadValues()
+        end
+    end)
 end
 
-local function patch(name, anchor, repl, mode)
-    local i, j = findOnce(anchor)
-    if not i then
-        report[#report + 1] = name .. ":FAILED"
-        warn("patch failed: " .. name)
-        return
+---------------- remotes ----------------
+local Trade = RS:WaitForChild("Trade", 15)
+assert(Trade, "Trade folder not found")
+local R = {
+    Send = Trade:FindFirstChild("SendRequest"), Cancel = Trade:FindFirstChild("CancelRequest"),
+    Offer = Trade:FindFirstChild("OfferItem"), Confirm = Trade:FindFirstChild("AcceptTrade"),
+    Decline = Trade:FindFirstChild("DeclineTrade"), Start = Trade:FindFirstChild("StartTrade"),
+    Update = Trade:FindFirstChild("UpdateTrade"), GetReq = Trade:FindFirstChild("GetRequest"),
+}
+assert(R.Send and R.Offer and R.Confirm and R.Decline, "a Trade remote is missing")
+local invRemote
+do
+    local rem = RS:FindFirstChild("Remotes")
+    local ex = rem and rem:FindFirstChild("Extras")
+    invRemote = ex and ex:FindFirstChild("GetFullInventory")
+end
+assert(invRemote, "GetFullInventory remote not found")
+
+if C.REMOVE_REMOTE == "" then
+    for _, child in ipairs(Trade:GetChildren()) do
+        local n = child.Name:lower()
+        if n:find("remove") or n:find("unoffer") or n:find("takeback") or n:find("withdraw") then
+            C.REMOVE_REMOTE = child.Name
+            break
+        end
     end
-    if mode == "before" then
-        inner = inner:sub(1, i - 1) .. repl .. "\n" .. inner:sub(i)
-    elseif mode == "after" then
-        inner = inner:sub(1, j) .. "\n" .. repl .. inner:sub(j + 1)
-    else
-        inner = inner:sub(1, i - 1) .. repl .. inner:sub(j + 1)
-    end
-    report[#report + 1] = name .. ":ok"
+end
+if C.REMOVE_REMOTE ~= "" then
+    R.Remove = Trade:FindFirstChild(C.REMOVE_REMOTE)
+end
+local removeBroken = false
+
+if C.SPY and hookmetamethod and getnamecallmethod then
+    pcall(function()
+        local oldNc
+        oldNc = hookmetamethod(game, "__namecall", function(self, ...)
+            local m = getnamecallmethod()
+            if (m == "FireServer" or m == "InvokeServer") and typeof(self) == "Instance" and self.Parent == Trade then
+                local args = table.pack(...)
+                task.spawn(function()
+                    local d = {}
+                    for i = 1, args.n do d[i] = dump(args[i]) end
+                    log("[OUT]", self.Name, table.concat(d, " | "))
+                end)
+            end
+            return oldNc(self, ...)
+        end)
+    end)
 end
 
-if inner:find(MARK, 1, true) then
-    print("[patch] already patched, starting")
-else
-    -- 1) safer defaults + secrets out of the file
-    patch("defaults", "local BASE = {", [===[
-C.BLOCK_NON_FRIENDS = false
-C.CHAT_ADD = false
-C.TG_TOKEN = ""
-C.TG_CHAT = ""
-C._patches = "__PATCHES__"
-]===], "before")
+---------------- inventory ----------------
+local function invoke(rf, arg)
+    local res, done = nil, false
+    task.spawn(function()
+        local ok, r = pcall(function() return rf:InvokeServer(arg) end)
+        if ok then res = r end
+        done = true
+    end)
+    local t = os.clock()
+    while not done and os.clock() - t < 6 do task.wait(0.1) end
+    return res
+end
 
-    -- 2) inventory reading with retries and reasons
-    patch("inventory", "local invCache = {}", [===[
-readInventory = function(plr)
+local keysLogged = false
+local function readInventory(plr)
     local reason = "?"
     for attemptNo = 1, 2 do
         local res = invoke(invRemote, plr.Name)
@@ -84,7 +678,17 @@ readInventory = function(plr)
             reason = "userId mismatch"
         else
             local owned = type(res.Weapons) == "table" and res.Weapons.Owned
-            if type(owned) == "table" then return owned end
+            if type(owned) == "table" then
+                if not keysLogged then
+                    keysLogged = true
+                    local k = {}
+                    for key in pairs(res) do k[#k + 1] = tostring(key) end
+                    table.sort(k)
+                    local str = table.concat(k, ",")
+                    for i = 1, #str, 180 do log("inv keys:", str:sub(i, i + 179)) end
+                end
+                return owned
+            end
             reason = "no Weapons.Owned"
         end
         task.wait(0.6)
@@ -92,11 +696,273 @@ readInventory = function(plr)
     log("inventory unreadable:", plr.Name, "-", reason)
     return nil
 end
-]===], "before")
 
-    -- 3) verify the bundle landed, re-offer anything missing
-    patch("reoffer", "state.bundleDone = os.clock()", [===[
-        state._accRetry, state._accSince = 0, nil
+local invCache = {}
+local function cachedInventory(plr)
+    local c = invCache[plr.UserId]
+    if c and os.clock() - c.t < C.INV_TTL then return c.owned end
+    local owned = readInventory(plr)
+    if owned then invCache[plr.UserId] = { t = os.clock(), owned = owned } end
+    return owned
+end
+
+local function offerable(id, v)
+    if C.KEEP[id] or C.NEVER_OFFER[id] or v <= 0 then return false end
+    if next(C.ONLY_OFFER) ~= nil then return C.ONLY_OFFER[id] == true end
+    return v >= C.MIN_ITEM_OFFER and v <= C.MAX_ITEM_OFFER
+end
+
+local function isGodly(id)
+    if C.GODLY_EXTRA[id] then return true end
+    local n = tostring(id)
+    if n:find("Chroma") and not C.GODLY_INCLUDE_CHROMA then return false end
+    local raw = val(id)
+    return raw >= 800
+end
+
+local function myItems()
+    local owned = readInventory(me)
+    if not owned then return nil end
+    local list, unknown = {}, {}
+    for id, c in pairs(owned) do
+        id = tostring(id)
+        local raw = val(id)
+        if raw == 0 and not C.KEEP[id] then unknown[#unknown + 1] = id end
+        if offerable(id, raw) then
+            local av = aval(id)
+            for _ = 1, math.min(tonumber(c) or 1, C.MAX_OFFER_ITEMS) do
+                list[#list + 1] = { id = id, v = av, raw = raw }
+            end
+        end
+    end
+    if #unknown > 0 then noteUnknown(unknown, "mine") end
+    table.sort(list, function(a, b) return a.v > b.v end)
+    return list
+end
+
+local function buildBundle(list, budget)
+    local pool = {}
+    for _, it in ipairs(list) do
+        if it.v <= budget then
+            pool[#pool + 1] = it
+            if #pool >= C.POOL_LIMIT then break end
+        end
+    end
+    local best, bestTot = {}, 0
+    local picks, nodes = {}, 0
+    local function dfs(i, tot)
+        if tot > bestTot or (tot == bestTot and tot > 0 and #picks < #best) then
+            best = table.clone(picks)
+            bestTot = tot
+        end
+        if #picks >= C.MAX_OFFER_ITEMS or bestTot >= budget then return end
+        for j = i, #pool do
+            nodes += 1
+            if nodes > 20000 then return end
+            local v = pool[j].v
+            if tot + v <= budget then
+                picks[#picks + 1] = pool[j].id
+                dfs(j + 1, tot + v)
+                picks[#picks] = nil
+                if bestTot >= budget then return end
+            end
+        end
+    end
+    dfs(1, 0)
+    return best, bestTot
+end
+
+local function pickDeal(theirOwned, mylist)
+    local cands, unk = {}, {}
+    for id in pairs(theirOwned) do
+        id = tostring(id)
+        local raw = val(id)
+        if raw == 0 then unk[#unk + 1] = id end
+        local d = dem(id)
+        if raw >= C.MIN_TARGET_VALUE and raw <= C.MAX_TARGET_VALUE
+            and (not C.USE_DEMAND or d >= C.MIN_TARGET_DEMAND) then
+            cands[#cands + 1] = { id = id, v = aval(id), raw = raw, d = d }
+        end
+    end
+    if #unk > 0 then noteUnknown(unk, "theirs") end
+    table.sort(cands, function(a, b) return a.v > b.v end)
+    local best
+    for i = 1, math.min(#cands, C.CANDIDATES) do
+        local vT = cands[i].v
+        local budget = math.min(vT / C.MIN_GAIN, C.MAX_TRADE_RISK)
+        local bundle, tot = buildBundle(mylist, budget)
+        if #bundle > 0 and tot >= budget * C.MIN_FILL and vT - tot >= C.MIN_PROFIT then
+            if C.LIQUIDITY_GUARD then
+                local theirD = cands[i].d
+                local myMinD = 99
+                for _, id in ipairs(bundle) do
+                    myMinD = math.min(myMinD, dem(id))
+                end
+                if theirD < C.LIQUIDITY_MIN_D and myMinD >= C.LIQUIDITY_MIN_D then
+                    -- skip liquid for low demand
+                else
+                    local score = vT - tot
+                    if not best or score > best.score then
+                        best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
+                                 bundle = bundle, tot = tot, score = score }
+                    end
+                end
+            else
+                local score = vT - tot
+                if not best or score > best.score then
+                    best = { item = cands[i].id, vT = vT, raw = cands[i].raw, d = cands[i].d,
+                             bundle = bundle, tot = tot, score = score }
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function godlyPool(mylist)
+    local g = {}
+    for _, it in ipairs(mylist) do
+        if isGodly(it.id) then g[#g + 1] = it end
+    end
+    return g
+end
+
+local function makeDeal(theirOwned, mylist)
+    local deal = pickDeal(theirOwned, mylist)
+    if not deal then return nil end
+    if C.UPFRONT_GODLYS and R.Remove and not removeBroken then
+        local pool = godlyPool(mylist)
+        if #pool > 0 then
+            deal.upfront = true
+            deal.pool = pool
+        end
+    end
+    return deal
+end
+
+---------------- player history ----------------
+local hist = loadJson(C.PLAYERS_FILE)
+for k, h in pairs(hist) do
+    if type(h) ~= "table" or os.time() - (h.t or 0) > 86400 * 2 then hist[k] = nil end
+end
+local function blacklisted(plr)
+    local h = hist[tostring(plr.UserId)]
+    return h and (h.ok or 0) == 0 and (h.d or 0) >= C.BLACKLIST_AFTER and os.time() - (h.t or 0) < C.BLACKLIST_SECS
+end
+local function recordHist(plr, ok)
+    local k = tostring(plr.UserId)
+    local h = hist[k] or { d = 0, ok = 0 }
+    h.t = os.time()
+    h.off = nil
+    if ok then h.ok = (h.ok or 0) + 1 h.d = 0 else h.d = (h.d or 0) + 1 end
+    hist[k] = h
+    saveJson(C.PLAYERS_FILE, hist)
+end
+
+local function markOff(plr)
+    local k = tostring(plr.UserId)
+    local h = hist[k] or { d = 0, ok = 0 }
+    h.t, h.off = os.time(), true
+    hist[k] = h
+    saveJson(C.PLAYERS_FILE, hist)
+end
+
+---------------- trade state ----------------
+local state = { target = nil, targetPlr = nil, bundle = nil, inTrade = false, completed = false,
+                latest = nil, lastSig = "", myAccepted = false, confirming = false,
+                theirCount = 0, bundleDone = nil, nudged = false,
+                curMineV = 0, curTheirV = 0, curMineR = 0, curTheirR = 0,
+                curMine = {}, curTheirs = {}, recorded = false,
+                upfront = false, pool = {}, syncing = false, syncCount = 0, sysFail = false, offering = false,
+                _accRetry = 0, _accSince = nil }
+
+local addCount, lastAdd = 0, 0
+local function promptAdd(kind)
+    if not C.CHAT_ADD or addCount >= C.MAX_ADD_PROMPTS or os.clock() - lastAdd < C.ADD_COOLDOWN then return end
+    local pool = (kind == "fair") and C.ADD_FAIR or C.ADD_LOW
+    if say(pool[math.random(#pool)]) then
+        addCount += 1
+        lastAdd = os.clock()
+    end
+end
+
+local function isMe(p) return p == me or tostring(p) == me.Name end
+
+local function readOffers(data)
+    local mine, theirs, other, myAcc = {}, {}, nil, false
+    if type(data) ~= "table" then return mine, theirs, other, myAcc end
+    for _, key in ipairs({"Player1", "Player2"}) do
+        local side = data[key]
+        if type(side) == "table" then
+            local mineSide = isMe(side.Player)
+            if mineSide then myAcc = side.Accepted == true else other = tostring(side.Player) end
+            local into = mineSide and mine or theirs
+            for _, it in pairs(side.Offer or {}) do
+                if type(it) == "table" and it[1] then
+                    for _ = 1, (tonumber(it[2]) or 1) do table.insert(into, tostring(it[1])) end
+                end
+            end
+        end
+    end
+    return mine, theirs, other, myAcc
+end
+
+local function total(list) local t = 0 for _, n in ipairs(list) do t += aval(n) end return t end
+local function rawTotal(list) local t = 0 for _, n in ipairs(list) do t += val(n) end return t end
+
+local function sameMultiset(a, b)
+    if #a ~= #b then return false end
+    local c = {}
+    for _, x in ipairs(a) do c[x] = (c[x] or 0) + 1 end
+    for _, x in ipairs(b) do
+        if not c[x] or c[x] == 0 then return false end
+        c[x] -= 1
+    end
+    return true
+end
+
+local function resetTradeState()
+    state.inTrade, state.completed, state.latest, state.lastSig, state.myAccepted = false, false, nil, "", false
+    state.confirming, state.theirCount, state.bundleDone, state.nudged, state.recorded = false, 0, nil, false, false
+    state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = 0, 0, 0, 0
+    state.curMine, state.curTheirs = {}, {}
+    state.syncing, state.syncCount, state.offering = false, 0, false
+    state._accRetry, state._accSince = 0, nil
+    addCount, lastAdd = 0, 0
+end
+
+if R.GetReq then
+    R.GetReq.OnClientEvent:Connect(function(plr) log("ignoring incoming request from", tostring(plr)) end)
+end
+
+do
+    local rsent = Trade:FindFirstChild("RequestSent")
+    if rsent then rsent.OnClientEvent:Connect(function(...) log("RequestSent event:", dump({...})) end) end
+end
+
+if R.Start then
+    R.Start.OnClientEvent:Connect(function(data, other)
+        local otherName = tostring(other)
+        if not state.target or otherName:lower() ~= state.target:lower() then
+            log("unexpected trade with", otherName, "- doing nothing")
+            return
+        end
+        resetTradeState()
+        state.inTrade = true
+        log("trade started with", otherName)
+        task.wait(1)
+        state.offering = true
+        local toOffer = state.upfront and initialGodlys(state.pool) or (state.bundle or {})
+        for _, id in ipairs(toOffer) do
+            if not state.inTrade then break end
+            R.Offer:FireServer(id, "Weapons")
+            log("offered", id, "(" .. val(id) .. ", d" .. dem(id) .. ")")
+            task.wait(0.6)
+        end
+        state.offering = false
+        state.bundleDone = os.clock()
+
+        -- v8.3.1: re-offer anything that didn't land
         for _round = 1, 3 do
             if not state.inTrade or state.upfront then break end
             local landed = false
@@ -126,10 +992,256 @@ end
             end
             state.offering = false
         end
-]===], "after")
+    end)
+end
 
-    -- 4) retry confirm if a good deal never got accepted
-    patch("reconfirm", "if plr.Parent ~= Players then break end", [===[
+local function confirm()
+    local ld = state.latest
+    if not (ld and R.Confirm) or state.confirming then return end
+    state.confirming = true
+    if ld.LastOffer then
+        R.Confirm:FireServer(ld.LastOffer)
+        log("confirm sent with LASTOFFER")
+    else
+        R.Confirm:FireServer(570)
+        log("confirm sent with 570")
+    end
+    task.wait(1.5)
+    state.confirming = false
+end
+
+local function callRemote(r, ...)
+    local args = table.pack(...)
+    pcall(function()
+        if r:IsA("RemoteFunction") then
+            r:InvokeServer(table.unpack(args, 1, args.n))
+        else
+            r:FireServer(table.unpack(args, 1, args.n))
+        end
+    end)
+end
+
+local function initialGodlys(pool)
+    local out = {}
+    for i = 1, math.min(#pool, C.UPFRONT_MAX) do out[#out + 1] = pool[i].id end
+    return out
+end
+
+local function desiredBundle(theirs, mine)
+    if state.syncCount >= C.MAX_SYNCS then return table.clone(mine) end
+    local budget = math.min(total(theirs) / C.MIN_GAIN, C.MAX_TRADE_RISK)
+    local bundle, tot = buildBundle(state.pool, budget)
+    if #bundle == 0 or tot < budget * C.MIN_FILL then return {} end
+    return bundle
+end
+
+local function syncOffer(mine, desired)
+    state.syncing = true
+    state.syncCount += 1
+    local keep = {}
+    for _, id in ipairs(desired) do keep[id] = (keep[id] or 0) + 1 end
+    local toRemove = {}
+    for _, id in ipairs(mine) do
+        if (keep[id] or 0) > 0 then keep[id] -= 1 else toRemove[#toRemove + 1] = id end
+    end
+    local toAdd = {}
+    for id, n in pairs(keep) do
+        for _ = 1, n do toAdd[#toAdd + 1] = id end
+    end
+    log("adjusting: remove [" .. table.concat(toRemove, ",") .. "] add [" .. table.concat(toAdd, ",") .. "]")
+    for _, id in ipairs(toRemove) do
+        if not state.inTrade then break end
+        if C.REMOVE_WITH_TYPE then callRemote(R.Remove, id, "Weapons") else callRemote(R.Remove, id) end
+        task.wait(0.6)
+    end
+    for _, id in ipairs(toAdd) do
+        if not state.inTrade then break end
+        R.Offer:FireServer(id, "Weapons")
+        task.wait(0.6)
+    end
+    local ok, t = false, os.clock()
+    while state.inTrade and os.clock() - t < 5 do
+        local m = readOffers(state.latest)
+        if sameMultiset(m, desired) then ok = true break end
+        task.wait(0.25)
+    end
+    state.syncing = false
+    if not state.inTrade then return false end
+    if not ok then
+        removeBroken = true
+        state.sysFail = true
+        log("remove did not work (wrong remote/args?) - declining, godly-first off until restart")
+        notify("error", "Godly-first: remove failed", "Remote: " .. tostring(R.Remove and R.Remove.Name) .. " - check the [OUT] log")
+        pcall(function() R.Decline:FireServer() end)
+        state.inTrade = false
+        return false
+    end
+    return true
+end
+
+local evaluate
+local evalDepth = 0
+evaluate = function()
+    if state.syncing or state.offering then return end
+    if evalDepth > 2 then return end
+    evalDepth += 1
+    local data = state.latest
+    if not state.inTrade or type(data) ~= "table" then evalDepth -= 1 return end
+    local mine, theirs, other, myAcc = readOffers(data)
+    state.myAccepted = myAcc
+    if other and state.target and other:lower() ~= state.target:lower() then evalDepth -= 1 return end
+    state.theirCount = #theirs
+    local sig = table.concat(mine, ",") .. "|" .. table.concat(theirs, ",")
+    if sig == state.lastSig then evalDepth -= 1 return end
+    state.lastSig = sig
+    local mv, tv = total(mine), total(theirs)
+    local mr, tr = rawTotal(mine), rawTotal(theirs)
+    state.curMineV, state.curTheirV, state.curMineR, state.curTheirR = mv, tv, mr, tr
+    state.curMine, state.curTheirs = mine, theirs
+    log("mine(" .. mv .. "/" .. mr .. "):", table.concat(mine, ","), "| theirs(" .. tv .. "/" .. tr .. "):", table.concat(theirs, ","))
+    local zero = {}
+    for _, id in ipairs(theirs) do if val(id) == 0 then zero[#zero + 1] = id end end
+    for _, id in ipairs(mine) do if val(id) == 0 then zero[#zero + 1] = id end end
+    if #zero > 0 then noteUnknown(zero, "trade") end
+
+    if #theirs == 0 then evalDepth -= 1 return end
+    if state.upfront then
+        local desired = desiredBundle(theirs, mine)
+        if #desired == 0 then
+            state.upfront = false
+            if #mine > 0 then
+                if not syncOffer(mine, {}) then evalDepth -= 1 return end
+                state.lastSig = ""
+                evalDepth -= 1
+                return evaluate()
+            end
+        else
+            state.bundle = desired
+            if not sameMultiset(mine, desired) then
+                if not syncOffer(mine, desired) then evalDepth -= 1 return end
+                state.lastSig = ""
+                evalDepth -= 1
+                return evaluate()
+            end
+        end
+    end
+
+    if not sameMultiset(mine, state.bundle or {}) then evalDepth -= 1 return end
+    if tv < mv * C.MIN_GAIN or tv - mv < C.MIN_PROFIT then
+        log("not enough:", tv, "<", math.max(mv * C.MIN_GAIN, mv + C.MIN_PROFIT))
+        promptAdd(tv >= mv and "fair" or "low")
+        evalDepth -= 1
+        return
+    end
+    task.wait(1.5)
+    local m2, t2 = readOffers(state.latest)
+    if state.inTrade and table.concat(m2, ",") .. "|" .. table.concat(t2, ",") == sig then
+        log("accepting: they give", tv, "for my", mv, "(raw " .. tr .. " / " .. mr .. ")")
+        confirm()
+    else
+        log("offer changed, not confirming")
+    end
+    evalDepth -= 1
+end
+
+if R.Update then
+    R.Update.OnClientEvent:Connect(function(data)
+        if not state.inTrade or type(data) ~= "table" then return end
+        state.latest = data
+        evaluate()
+    end)
+end
+
+for _, name in ipairs({"CompleteTrade", "EndTrade", "DeclineTrade"}) do
+    local r = Trade:FindFirstChild(name)
+    if r then
+        r.OnClientEvent:Connect(function()
+            if name == "CompleteTrade" then
+                state.completed = true
+                if state.target and not state.recorded then
+                    state.recorded = true
+                    local g, t = state.curMineR, state.curTheirR
+                    S.trades += 1 S.given += g S.got += t
+                    L.trades += 1 L.given += g L.got += t
+                    saveJson(C.STATS_FILE, L)
+                    local big = {}
+                    for _, id in ipairs(state.curTheirs) do
+                        if val(id) >= C.BIG_VALUE then big[#big + 1] = id .. " (" .. val(id) .. ")" end
+                    end
+                    notify("trade", "Trade completed with " .. tostring(state.target),
+                        string.format("Got %d: %s\nGave %d: %s\nNet %+d (adj %+d) | session net %+d",
+                            t, table.concat(state.curTheirs, ", "), g, table.concat(state.curMine, ", "),
+                            t - g, state.curTheirV - state.curMineV, S.got - S.given))
+                    if #big > 0 then
+                        notify("big", "BIG HAUL from " .. tostring(state.target), table.concat(big, ", "))
+                    end
+                    for _, id in ipairs(state.curTheirs) do
+                        if val(id) == 0 then
+                            log("UNKNOWN ITEM received:", id, "- add to ALIASES or CUSTOM_VALUES")
+                        end
+                    end
+                end
+            end
+            state.inTrade = false
+            log("trade ended:", name)
+        end)
+    end
+end
+
+local REFUSE_WORDS = { "disabled", "not accepting", "cannot", "can't", "busy", "already", "blocked",
+                       "unavailable", "declined", "turned off", "requests off", "not allowed" }
+local function requestRefused(res)
+    if res == false then return true end
+    if type(res) == "string" then
+        local l = res:lower()
+        for _, w in ipairs(REFUSE_WORDS) do
+            if l:find(w, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+local function attempt(plr, deal)
+    state.target, state.targetPlr, state.bundle = plr.Name, plr, deal.bundle
+    state.upfront, state.pool, state.sysFail = deal.upfront == true, deal.pool or {}, false
+    if state.upfront then state.bundle = initialGodlys(state.pool) end
+    resetTradeState()
+    S.requests += 1
+    log("requesting", plr.Name, "for", deal.item, "(adj " .. deal.vT .. ", raw " .. deal.raw .. ", d" .. deal.d .. ")",
+        "offering", table.concat(deal.bundle, "+"), "(adj " .. deal.tot .. ")")
+    local sendDone, sendRes = false, nil
+    task.spawn(function()
+        local ok, res = pcall(function() return R.Send:InvokeServer(plr) end)
+        sendRes, sendDone = (ok and res or nil), true
+        log("SendRequest ->", ok and dump(res) or ("error: " .. tostring(res)))
+    end)
+    local t = os.clock()
+    while not state.inTrade and os.clock() - t < C.REQUEST_TIMEOUT do
+        task.wait(0.25)
+        if sendDone and requestRefused(sendRes) then break end
+    end
+    if not state.inTrade then
+        local refused = sendDone and requestRefused(sendRes)
+        if R.Cancel then pcall(function() R.Cancel:FireServer() end) end
+        state.target, state.targetPlr, state.bundle = nil, nil, nil
+        if refused then
+            log(plr.Name .. " refused:", dump(sendRes))
+            markOff(plr)
+            return false, "refused"
+        elseif not sendDone then
+            log("no response from", plr.Name, "(not penalized)")
+            return false, nil
+        else
+            log("trade did not open with", plr.Name, "-", dump(sendRes))
+            return false, nil
+        end
+    end
+    t = os.clock()
+    while state.inTrade and os.clock() - t < C.TRADE_TIMEOUT do
+        task.wait(0.25)
+        if plr.Parent ~= Players then break end
+
+        -- v8.3.1: good deal but my accept never registered -> retry the confirm
         do
             local okAcc = state.inTrade and not state.myAccepted and not state.confirming
                 and not state.syncing and not state.offering and #state.curTheirs > 0
@@ -149,25 +1261,324 @@ end
                 state._accSince = nil
             end
         end
-]===], "after")
 
-    -- 5) show patch status in the start log
-    patch("startlog", 'log("v8.3 | only:",', 'log("v8.3.1 patches:", tostring(C._patches), "| only:",', "replace")
-
-    local i, j = inner:find("__PATCHES__", 1, true)
-    if i then
-        inner = inner:sub(1, i - 1) .. table.concat(report, ",") .. inner:sub(j + 1)
+        if state.bundleDone and state.theirCount == 0 then
+            local idle = os.clock() - state.bundleDone
+            if idle > C.IDLE_NUDGE and not state.nudged then
+                state.nudged = true
+                promptAdd("low")
+            end
+            if idle > C.IDLE_DECLINE then
+                log("nothing added, declining")
+                pcall(function() R.Decline:FireServer() end)
+                state.inTrade = false
+                break
+            end
+        end
     end
-    inner = MARK .. "\n" .. inner
-    print("[patch] " .. table.concat(report, ", "))
+    if state.inTrade then
+        log("trade timed out, declining")
+        pcall(function() R.Decline:FireServer() end)
+        state.inTrade = false
+    end
+    task.wait(0.5)
+    local ok = state.completed
+    if state.sysFail and not ok then
+        state.sysFail = false
+    elseif ok or (sendDone and not state.sysFail) then
+        if not ok then S.declined += 1 end
+        recordHist(plr, ok)
+    end
+    state.target, state.targetPlr, state.bundle = nil, nil, nil
+    return ok
 end
 
-local fn, err = loadstring(inner)
-if not fn then
-    warn("patched script failed to compile: " .. tostring(err) .. " - running unpatched")
-    fn, err = loadstring(original)
-    if not fn then warn("original failed too: " .. tostring(err)) return end
-else
-    pcall(writefile, FILE, inner)
+local visited = loadJson(C.VISITED_FILE)
+local revisit = visited["left:" .. game.JobId] ~= nil
+visited[game.JobId] = os.time()
+for id, ts in pairs(visited) do
+    if type(ts) ~= "number" or os.time() - ts > 7200 then visited[id] = nil end
 end
+saveJson(C.VISITED_FILE, visited)
+
+local hopping = false
+local function doTeleport(fn)
+    queueScript()
+    hopping = true
+    S.hops += 1
+    L.hops += 1
+    saveJson(C.STATS_FILE, L)
+    saveJson(C.VISITED_FILE, visited)
+    local ok = pcall(fn)
+    if not ok then hopping = false end
+    task.delay(25, function() hopping = false end)
+end
+
+local function fetchServers(cursor)
+    local path = "/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100" ..
+        (cursor and ("&cursor=" .. cursor) or "")
+    for _, host in ipairs({ "https://games.roblox.com", "https://games.roproxy.com" }) do
+        local body = httpGet(host .. path)
+        if body then
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok and type(data) == "table" and type(data.data) == "table" then return data end
+        end
+    end
+    return nil
+end
+
+local function hop()
+    if hopping then return end
+    visited["left:" .. game.JobId] = os.time()
+    local candidates, cursor, seen = {}, nil, 0
+    for _ = 1, 4 do
+        local data = fetchServers(cursor)
+        if not data then log("hop: server list fetch failed (http blocked?)") break end
+        seen += #data.data
+        for _, s in ipairs(data.data) do
+            if s.id ~= game.JobId and not visited[s.id] and s.playing and s.maxPlayers
+                and s.playing >= C.HOP_MIN_PLAYERS and s.playing < s.maxPlayers - 1 then
+                candidates[#candidates + 1] = s
+            end
+        end
+        cursor = data.nextPageCursor
+        if #candidates >= 10 or not cursor then break end
+    end
+    if #candidates == 0 then
+        log("hop: no candidates (seen " .. seen .. ") - random teleport")
+        notify("hop", "Hop (random)", "no server candidates, seen " .. seen)
+        doTeleport(function() TeleportService:Teleport(game.PlaceId, me) end)
+        return
+    end
+    local s = shuffle(candidates)[1]
+    visited[s.id] = os.time()
+    log("hopping to server with", s.playing, "players")
+    notify("hop", "Hopping", "to a server with " .. s.playing .. " players")
+    doTeleport(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, me) end)
+end
+
+TeleportService.TeleportInitFailed:Connect(function(_, result, msg)
+    log("teleport failed:", tostring(result), tostring(msg))
+    hopping = false
+end)
+
+pcall(function()
+    local overlay = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 5):WaitForChild("promptOverlay", 5)
+    overlay.ChildAdded:Connect(function(child)
+        if child.Name == "ErrorPrompt" then
+            log("disconnected, rejoining in 5s")
+            notify("error", "Disconnected", "rejoining in 5s")
+            queueScript()
+            task.wait(5)
+            pcall(function() TeleportService:Teleport(game.PlaceId, me) end)
+        end
+    end)
+end)
+
+local nextTry, fails = {}, {}
+local skip = {}
+for _, n in ipairs(C.SKIP_PLAYERS) do skip[n:lower()] = true end
+
+local function isFriend(plr)
+    if not C.SKIP_FRIENDS then return false end
+    local ok, r = pcall(function() return me:IsFriendsWith(plr.UserId) end)
+    return ok and r
+end
+
+local function eligible(plr)
+    if plr == me or plr.Parent ~= Players then return false end
+    if C.ONLY_PLAYER ~= "" and plr.Name:lower() ~= C.ONLY_PLAYER:lower() then return false end
+    if skip[plr.Name:lower()] then return false end
+    if (nextTry[plr.Name] or 0) > os.clock() then return false end
+    if blacklisted(plr) then return false end
+    local h = hist[tostring(plr.UserId)]
+    if h and os.time() - (h.t or 0) < (h.off and C.OFF_COOLDOWN or C.REATTEMPT_SECS) then return false end
+    return not isFriend(plr)
+end
+
+local function scanPlayers(plist)
+    local results, pending = {}, 0
+    for _, plr in ipairs(plist) do
+        pending += 1
+        task.spawn(function()
+            local owned = cachedInventory(plr)
+            if owned then results[#results + 1] = { plr = plr, owned = owned } end
+            pending -= 1
+        end)
+        task.wait(C.SCAN_STAGGER)
+    end
+    local t = os.clock()
+    while pending > 0 and os.clock() - t < 20 do task.wait(0.2) end
+    return results
+end
+
+local function summaryText()
+    local mins = math.floor((os.clock() - S.started) / 60)
+    return string.format("Session: %d trades, net %+d (in %d / out %d), %d hops, %dm up\nLifetime: %d trades, net %+d, %d hops",
+        S.trades, S.got - S.given, S.got, S.given, S.hops, mins, L.trades, L.got - L.given, L.hops)
+end
+
+local blockWorks = nil
+local function blockAll()
+    if not C.BLOCK_NON_FRIENDS or blockWorks == false then return end
+    local n = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if (L.blocked or 0) >= C.BLOCK_MAX then log("block cap reached, not blocking more") break end
+        if plr ~= me and not isFriend(plr) then
+            local ok = pcall(function() me:BlockUser(plr.UserId) end)
+            if ok then
+                n += 1
+                L.blocked = (L.blocked or 0) + 1
+                blockWorks = true
+            elseif blockWorks == nil then
+                blockWorks = false
+                log("blocking not supported here (BlockUser failed) - disabled")
+                break
+            end
+            task.wait(0.3)
+        end
+    end
+    if n > 0 then
+        saveJson(C.STATS_FILE, L)
+        log("blocked " .. n .. " players (total " .. (L.blocked or 0) .. ")")
+    end
+end
+
+local seenPlayers = loadJson(C.SEEN_FILE)
+for k, ts in pairs(seenPlayers) do
+    if type(ts) ~= "number" or os.time() - ts > 7200 then seenPlayers[k] = nil end
+end
+local firstCycle = true
+local function markSeen()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= me then seenPlayers[tostring(plr.UserId)] = os.time() end
+    end
+    saveJson(C.SEEN_FILE, seenPlayers)
+end
+
+local function runCycle()
+    while paused and not stopped do task.wait(0.5) end
+    if stopped then return false end
+    if firstCycle then
+        firstCycle = false
+        task.wait(4)
+        local n, old = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= me and not isFriend(plr) then
+                n += 1
+                if seenPlayers[tostring(plr.UserId)] then old += 1 end
+            end
+        end
+        if n >= 3 and old / n >= C.STALE_RATIO then
+            revisit = true
+            log(string.format("server looks stale: %d/%d players already seen", old, n))
+        end
+        markSeen()
+    end
+    if revisit then
+        revisit = false
+        log("landed back on a server I already left - hopping again")
+        if C.SERVER_HOP then blockAll() hop() end
+        task.wait(10)
+        return true
+    end
+
+    local mylist = myItems()
+    if not mylist then log("my inventory unreadable, retrying") task.wait(5) return true end
+    if #mylist == 0 then
+        log("no offerable items (value >= " .. C.MIN_ITEM_OFFER .. ") - stopping")
+        notify("stop", "Out of items", "No tradeable valued items left.\n" .. summaryText())
+        return false
+    end
+    local parts = {}
+    for i = 1, math.min(#mylist, 6) do parts[#parts + 1] = mylist[i].id .. "(" .. mylist[i].v .. ")" end
+    log("my items:", #mylist, "(adj) |", table.concat(parts, ", "))
+
+    local cands = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if eligible(plr) then cands[#cands + 1] = plr end
+    end
+    local scans = scanPlayers(shuffle(cands))
+    local deals = {}
+    for _, r in ipairs(scans) do
+        local d = makeDeal(r.owned, mylist)
+        if d then deals[#deals + 1] = { plr = r.plr, owned = r.owned, deal = d } end
+    end
+    table.sort(deals, function(a, b) return a.deal.score > b.deal.score end)
+    log(string.format("scanned %d/%d players, %d deals", #scans, #cands, #deals))
+
+    local didTrade, dirty = false, false
+    for _, e in ipairs(deals) do
+        if stopped then return false end
+        while paused and not stopped do task.wait(0.5) end
+        local plr = e.plr
+        if plr.Parent == Players then
+            local deal = e.deal
+            if dirty then deal = makeDeal(e.owned, mylist) end
+            if deal then
+                nextTry[plr.Name] = os.clock() + C.PLAYER_COOLDOWN
+                local done, why = attempt(plr, deal)
+                didTrade = true
+                invCache[plr.UserId] = nil
+                if done then
+                    fails[plr.Name] = nil
+                    mylist = myItems() or mylist
+                    dirty = true
+                    if #mylist == 0 then
+                        notify("stop", "Out of items", summaryText())
+                        return false
+                    end
+                elseif why == "refused" then
+                    nextTry[plr.Name] = os.clock() + C.OFF_COOLDOWN
+                    markOff(plr)
+                else
+                    local f = (fails[plr.Name] or 0) + 1
+                    fails[plr.Name] = f
+                    nextTry[plr.Name] = os.clock() + math.min(C.PLAYER_COOLDOWN * 2 ^ f, C.MAX_COOLDOWN)
+                end
+                task.wait(2)
+            end
+        end
+    end
+    if not didTrade then
+        if C.SERVER_HOP then blockAll() hop() end
+        task.wait(10)
+    end
+    return true
+end
+
+if C.SUMMARY_MINUTES > 0 then
+    task.spawn(function()
+        while not stopped do
+            task.wait(C.SUMMARY_MINUTES * 60)
+            notify("summary", "Status", summaryText())
+        end
+    end)
+end
+
+task.spawn(function()
+    log("v8.3.1 | only:", C.ONLY_PLAYER ~= "" and C.ONLY_PLAYER or "everyone", "| gain", C.MIN_GAIN,
+        "| demand", C.USE_DEMAND and ("on, min target d" .. C.MIN_TARGET_DEMAND) or "off",
+        "| liquidity", C.LIQUIDITY_GUARD and ("guard d>=" .. C.LIQUIDITY_MIN_D) or "off")
+    notify("start", "Trader started", "gain " .. C.MIN_GAIN .. " | " .. (C.ONLY_PLAYER ~= "" and ("only " .. C.ONLY_PLAYER) or "everyone"))
+    local errs = 0
+    while not stopped do
+        local ok, cont = pcall(runCycle)
+        if not ok then
+            errs += 1
+            log("ERROR:", tostring(cont))
+            notify("error", "Script error", tostring(cont))
+            task.wait(math.min(5 * errs, 60))
+        else
+            errs = 0
+            if cont == false then break end
+        end
+    end
+    log("stopped")
+end)
+
+]==]
+if writefile then pcall(writefile, "mm2_trader.txt", src) end
+local fn, err = loadstring(src)
+if not fn then warn("MM2 Trader failed to load: " .. tostring(err)) return end
 fn()
